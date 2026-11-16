@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TrueHDR</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <div class="brand">
+        <img src="icons/icon-64.png" alt="TrueHDR" class="logo" />
+        <div class="brand-text">
+          <div class="title-row">
+            <h1>TrueHDR</h1>
+            <span id="statusBadge" class="badge badge-idle">Checking…</span>
+          </div>
+          <p id="statusDetail" class="subtitle">Real-time WebGPU float16 EDR</p>
+        </div>
+      </div>
+      <label class="switch" title="Global TrueHDR Extension Enable">
+        <input type="checkbox" id="masterToggle" />
+        <span class="slider-track"></span>
+      </label>
+    </header>
+
+    <section id="siteBar" class="site-bar">
+      <span id="siteHost" class="site-host">—</span>
+      <button id="siteToggleBtn" class="chip-btn" type="button">Enabled on site</button>
+    </section>
+
+    <div id="corsBanner" class="banner hidden">
+      <span id="corsBannerText">Video blocked by cross-origin (CORS) policy.</span>
+      <button id="retryCorsBtn" class="banner-btn" type="button">Reload w/ CORS</button>
+    </div>
+
+    <section class="section">
+      <div class="section-head">
+        <div class="section-label">4K Super-Resolution</div>
+        <div class="section-right">
+          <span id="resBadge" class="res-pill">—</span>
+          <label class="switch switch-sm" title="Enable 4K GPU Upscaling">
+            <input type="checkbox" id="upscaleToggle" />
+            <span class="slider-track"></span>
+          </label>
+        </div>
+      </div>
+      <div id="upscaleBody" class="section-body">
+        <div class="presets presets-2">
+          <button class="upscale-btn" data-upscale="auto" type="button">Auto Display</button>
+          <button class="upscale-btn" data-upscale="4k" type="button">Force 4K</button>
+        </div>
+        <div id="sharpnessRow" class="control">
+          <div class="control-head">
+            <label for="upscaleSharpness">Detail Sharpness</label>
+            <span id="upscaleSharpnessVal" class="val">55%</span>
+          </div>
+          <input id="upscaleSharpness" type="range" min="0" max="1.0" step="0.05" />
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <div class="section-label">HDR (EDR Tone &amp; P3 Gamut)</div>
+        <label class="switch switch-sm" title="Enable Hardware EDR HDR">
+          <input type="checkbox" id="hdrToggle" />
+          <span class="slider-track"></span>
+        </label>
+      </div>
+      <div id="hdrBody" class="section-body">
+        <div class="presets">
+          <button class="preset-btn" data-preset="cinema" type="button">Cinema</button>
+          <button class="preset-btn" data-preset="vivid" type="button">Vivid XDR</button>
+          <button class="preset-btn" data-preset="neon" type="button">Neon</button>
+          <button class="preset-btn" data-preset="gentle" type="button">Gentle</button>
+        </div>
+
+        <div class="controls">
+          <div class="control">
+            <div class="control-head">
+              <label for="peakBoost">Peak EDR Brightness</label>
+              <span id="peakBoostVal" class="val">6.0×</span>
+            </div>
+            <input id="peakBoost" type="range" min="1.2" max="16.0" step="0.2" />
+          </div>
+
+          <div class="control">
+            <div class="control-head">
+              <label for="threshold">Highlight Knee</label>
+              <span id="thresholdVal" class="val">0.46</span>
+            </div>
+            <input id="threshold" type="range" min="0.15" max="0.85" step="0.01" />
+          </div>
+
+          <div class="control">
+            <div class="control-head">
+              <label for="localPunch">Specular Isolation</label>
+              <span id="localPunchVal" class="val">70%</span>
+            </div>
+            <input id="localPunch" type="range" min="0" max="1.5" step="0.05" />
+          </div>
+
+          <div class="control">
+            <div class="control-head">
+              <label for="gamutBoost">Wide Gamut (P3)</label>
+              <span id="gamutBoostVal" class="val">45%</span>
+            </div>
+            <input id="gamutBoost" type="range" min="0" max="1.0" step="0.05" />
+          </div>
+
+          <div class="control">
+            <div class="control-head">
+              <label for="shadowDepth">Shadow Depth</label>
+              <span id="shadowDepthVal" class="val">14%</span>
+            </div>
+            <input id="shadowDepth" type="range" min="0" max="0.45" step="0.01" />
+          </div>
+
+          <div class="control">
+            <div class="control-head">
+              <label for="aplGuard">White-Screen Guard</label>
+              <span id="aplGuardVal" class="val">45%</span>
+            </div>
+            <input id="aplGuard" type="range" min="0" max="1.0" step="0.02" />
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section toggles">
+      <label class="row-toggle">
+        <span>Split Compare (Original | Active)</span>
+        <input type="checkbox" id="splitEnabled" />
+      </label>
+      <div id="splitPosRow" class="control split-control hidden">
+        <div class="control-head">
+          <label for="splitPos">Wipe Position</label>
+          <span id="splitPosVal" class="val">50%</span>
+        </div>
+        <input id="splitPos" type="range" min="0.05" max="0.95" step="0.01" />
+      </div>
+      <label class="row-toggle">
+        <span>Auto-bypass native HDR videos</span>
+        <input type="checkbox" id="bypassNativeHdr" />
+      </label>
+    </section>
+
+    <footer class="footer">
+      <span>⌥H Toggle • ⌥S Split Compare</span>
+      <button id="resetBtn" class="link-btn" type="button">Reset</button>
+    </footer>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

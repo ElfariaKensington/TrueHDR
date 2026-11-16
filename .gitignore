@@ -1,0 +1,9 @@
+build/
+.DS_Store
+xcuserdata/
+training/data/
+training/runs/
+training/.venv/
+__pycache__/
+*.pyc
+dev/media/
