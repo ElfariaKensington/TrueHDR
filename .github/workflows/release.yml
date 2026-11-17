@@ -1,0 +1,95 @@
+name: Build & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create a GitHub Release (uncheck for build-only artifact)'
+        required: true
+        type: boolean
+        default: true
+      tag:
+        description: 'Tag name (leave blank to auto-generate next vX.Y.Z)'
+        required: false
+        type: string
+        default: ''
+      release_name:
+        description: 'Release title (leave blank to auto-generate)'
+        required: false
+        type: string
+        default: ''
+      prerelease:
+        description: 'Mark as prerelease'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate tag and release name
+        id: meta
+        run: |
+          BASE_VER=$(python3 -c "import json; print(json.load(open('extension/manifest.json'))['version'])")
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            IFS='.' read -r MAJ MIN PAT <<< "$BASE_VER"
+            PAT="${PAT:-0}"
+            while git rev-parse -q --verify "refs/tags/v${MAJ}.${MIN}.${PAT}" >/dev/null; do
+              PAT=$((PAT + 1))
+            done
+            TAG="v${MAJ}.${MIN}.${PAT}"
+          fi
+          TITLE="${{ inputs.release_name }}"
+          if [ -z "$TITLE" ]; then
+            TITLE="TrueHDR ${TAG} (macOS Safari)"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "title=$TITLE" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag=$TAG title=$TITLE"
+
+      - name: Build TrueHDR (Release)
+        run: |
+          xcodebuild \
+            -project xcode/TrueHDR/TrueHDR.xcodeproj \
+            -scheme TrueHDR \
+            -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Package app
+        run: |
+          ZIP="TrueHDR-${{ steps.meta.outputs.tag }}-macOS.zip"
+          ditto -c -k --sequesterRsrc --keepParent \
+            build/Build/Products/Release/TrueHDR.app \
+            "$ZIP"
+          shasum -a 256 "$ZIP"
+          echo "zip=$ZIP" >> "$GITHUB_ENV"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrueHDR-${{ steps.meta.outputs.tag }}-macOS
+          path: ${{ env.ZIP }}
+
+      - name: Create GitHub Release
+        if: ${{ inputs.create_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          FLAGS=(--generate-notes --title "${{ steps.meta.outputs.title }}" --target "${{ github.sha }}")
+          if [ "${{ inputs.prerelease }}" = "true" ]; then
+            FLAGS+=(--prerelease)
+          fi
+          gh release create "${{ steps.meta.outputs.tag }}" "${{ env.ZIP }}" "${FLAGS[@]}"
