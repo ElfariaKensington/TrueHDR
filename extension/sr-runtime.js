@@ -482,15 +482,9 @@
     });
   }
 
-  async function create(device, opts) {
-    opts = opts || {};
-    var m = registry().get(opts.modelId);
-    if (!m) throw new Error('TrueHDR SR: unknown model ' + opts.modelId);
-    var f16 = !!opts.useF16;
-    if (f16 && !device.features.has('shader-f16')) throw new Error('TrueHDR SR: useF16 requires the shader-f16 feature');
-    var outFmt = opts.outputFormat || 'rgba16float'; // rgba32float only for verification
-    if (outFmt !== 'rgba16float' && outFmt !== 'rgba32float') throw new Error('TrueHDR SR: bad outputFormat');
-    var cfg = Object.assign({}, DEFAULT_CONFIG, opts.config || {});
+  var pipelineCache = typeof WeakMap === 'function' ? new WeakMap() : null;
+
+  async function getBuilt(device, m, f16, cfg, outFmt) {
     var layers = prepareModel(m);
     var P = plan(layers);
     var maxSmem = (device.limits && device.limits.maxComputeWorkgroupStorageSize) || 16384;
@@ -524,6 +518,33 @@
     }));
     var err = await device.popErrorScope();
     if (err) throw new Error('TrueHDR SR: pipeline creation failed: ' + err.message);
+    return { P: P, built: built };
+  }
+
+  async function create(device, opts) {
+    opts = opts || {};
+    var m = registry().get(opts.modelId);
+    if (!m) throw new Error('TrueHDR SR: unknown model ' + opts.modelId);
+    var f16 = !!opts.useF16;
+    if (f16 && !device.features.has('shader-f16')) throw new Error('TrueHDR SR: useF16 requires the shader-f16 feature');
+    var outFmt = opts.outputFormat || 'rgba16float'; // rgba32float only for verification
+    if (outFmt !== 'rgba16float' && outFmt !== 'rgba32float') throw new Error('TrueHDR SR: bad outputFormat');
+    var cfg = Object.assign({}, DEFAULT_CONFIG, opts.config || {});
+    var compiled;
+    if (pipelineCache && !opts.config) {
+      var byKey = pipelineCache.get(device);
+      if (!byKey) { byKey = new Map(); pipelineCache.set(device, byKey); }
+      var ck = m.id + '|' + (f16 ? 1 : 0) + '|' + outFmt;
+      var prom = byKey.get(ck);
+      if (!prom) {
+        prom = getBuilt(device, m, f16, cfg, outFmt).catch(function (e) { byKey.delete(ck); throw e; });
+        byKey.set(ck, prom);
+      }
+      compiled = await prom;
+    } else {
+      compiled = await getBuilt(device, m, f16, cfg, outFmt);
+    }
+    var P = compiled.P, built = compiled.built;
 
     var uniform = device.createBuffer({ label: 'truehdr-sr-size', size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     var state = { w: 0, h: 0, textures: [], views: [], out: null, outView: null, staticBG: [], inputBG: [], destroyed: false };
@@ -605,7 +626,7 @@
       modelId: m.id,
       scale: 2,
       encode: function (encoder, inputView, w, h) { return encodeImpl(encoder, inputView, w, h, null); },
-      destroy: function () { state.destroyed = true; freeSized(); uniform.destroy(); built.forEach(function (b) { if (b.wbuf) b.wbuf.destroy(); }); },
+      destroy: function () { state.destroyed = true; freeSized(); uniform.destroy(); },
       // diagnostics (bench/tests): per-kernel timestamps, generated code, texture of the output
       _encodeTimed: encodeImpl,
       _passCount: built.length,

@@ -1213,7 +1213,7 @@
 
   const SR_TIERS = ['quality', 'fast', 'spatial'];
   const SR_BUDGET_FRACTION = 0.6;   // of the video frame interval
-  const SR_BUDGET_STRIKES = 24;     // over-budget samples (every 4th frame) before stepping down
+  const SR_BUDGET_STRIKES = 6;      // over-budget samples before stepping down
 
   let settings = { ...DEFAULT_SETTINGS };
   let isEdrDisplay = window.matchMedia('(dynamic-range: high)').matches;
@@ -2016,14 +2016,14 @@
 
     noteGpuTime(ms) {
       if (typeof ms !== 'number' || !(ms >= 0) || !isFinite(ms)) return;
-      this.gpuMs = this.gpuMs == null ? ms : this.gpuMs * 0.8 + ms * 0.2;
+      this.gpuMs = this.gpuMs == null ? ms : this.gpuMs * 0.5 + ms * 0.5;
       if (this.srPasses === 0) {
         this.overBudget = 0;
         return;
       }
       const budget = SR_BUDGET_FRACTION * this.frameIntervalMs;
       if (this.gpuMs > budget) {
-        this.overBudget++;
+        this.overBudget += ms > budget * 1.5 ? 2 : 1;
       } else {
         this.overBudget = Math.max(0, this.overBudget - 2);
       }
@@ -2096,7 +2096,8 @@
       this.frameSeed = (this.frameSeed + 1) % 256;
       const reset = this.resetStateNextFrame;
       this.resetStateNextFrame = false;
-      const measure = (this.frameCounter++ & 3) === 0;
+      const measure = this.gpuMs === null || this.frameCounter < 24 || this.overBudget > 0 || (this.frameCounter & 3) === 0;
+      this.frameCounter++;
 
       const encoder = device.createCommandEncoder();
       let result;
