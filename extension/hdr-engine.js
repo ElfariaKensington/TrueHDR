@@ -1669,6 +1669,7 @@
       tw.w = this.canvas.width;
       tw.h = this.canvas.height;
       try {
+        tw.ctx.unconfigure();
         tw.ctx.configure({ device: gpuState.device, format: 'rgba16float', colorSpace: 'display-p3', toneMapping: { mode: 'extended' }, alphaMode: 'premultiplied' });
       } catch (_) { return false; }
       tw.lastCfgMs = performance.now();
@@ -1676,7 +1677,7 @@
     }
 
     // Called every frame and from the focus poll/events: switch between main and twin canvas,
-    // and re-configure the twin after WebKit's screenPropertiesChanged suppression arrives.
+    // and re-configure the twin once after WebKit's screenPropertiesChanged suppression arrives.
     updateFocusTwin(fromRender = false) {
       const tw = this.twin;
       if (!tw || !this.canvas || gpuState.status !== 'ready') return;
@@ -1691,13 +1692,12 @@
       }
       const now = performance.now();
       const sizeChanged = want && (tw.w !== this.canvas.width || tw.h !== this.canvas.height);
-      const needPeriodic = !fromRender && want && tw.on && (now - tw.lastCfgMs) >= (tw.rearm > 0 ? 450 : 2000);
-      if (want === tw.on && !sizeChanged && !needPeriodic) return;
+      const needRearm = !fromRender && want && tw.on && tw.rearm > 0 && (now - tw.lastCfgMs) >= 450;
+      if (want === tw.on && !sizeChanged && !needRearm) return;
       if (want) {
         const turningOn = !tw.on;
         if (!this.configureTwin()) return;
-        if (turningOn) tw.rearm = 2;
-        else if (tw.rearm > 0) tw.rearm--;
+        tw.rearm = turningOn ? 1 : 0;
         for (const k of ['left', 'top', 'width', 'height', 'zIndex', 'borderRadius']) tw.canvas.style[k] = this.canvas.style[k];
         tw.canvas.style.display = 'block';
         this.canvas.style.visibility = 'hidden';
@@ -2251,11 +2251,15 @@
       this.video.removeEventListener('loadedmetadata', this.boundCheckMeta);
       this.video.removeEventListener('resize', this.boundCheckMeta);
       this.video.removeEventListener('encrypted', this.boundCheckMeta);
+      if (this.ctx) {
+        try { this.ctx.unconfigure(); } catch (_) {}
+      }
       if (this.canvas && this.canvas.parentElement) {
         this.canvas.remove();
       }
-      if (this.twin && this.twin.canvas.parentElement) {
-        this.twin.canvas.remove();
+      if (this.twin) {
+        try { this.twin.ctx.unconfigure(); } catch (_) {}
+        if (this.twin.canvas.parentElement) this.twin.canvas.remove();
       }
       if (this.splitHandle && this.splitHandle.parentElement) {
         this.splitHandle.remove();
