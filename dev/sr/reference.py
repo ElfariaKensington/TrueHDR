@@ -47,11 +47,17 @@ def decode_f16(b64):
     return np.frombuffer(base64.b64decode(b64), dtype='<f2').astype(np.float64)
 
 
+def decode_q8(wq_b64, ws_b64, cout, fan_in):
+    q = np.frombuffer(base64.b64decode(wq_b64), dtype=np.int8).astype(np.float64).reshape(cout, fan_in)
+    s = decode_f16(ws_b64).reshape(cout, 1)
+    return (q * s).reshape(-1)
+
+
 def decode_layers(entry, dtype=torch.float64):
     layers = []
     for l in entry['layers']:
         k, cin, cout = int(l['k']), int(l['cin']), int(l['cout'])
-        w = decode_f16(l['w'])
+        w = decode_q8(l['wq'], l['ws'], cout, cin * k * k) if 'wq' in l else decode_f16(l['w'])
         assert w.size == cout * cin * k * k, ('bad weight size', entry['id'])
         b = decode_f16(l['b'])
         assert b.size == cout

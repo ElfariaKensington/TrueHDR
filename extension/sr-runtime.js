@@ -53,6 +53,21 @@
     }
     return out;
   }
+  function decodeQ8(wqB64, wsB64, cout, fanIn, what) {
+    var q = b64ToBytes(wqB64);
+    var n = cout * fanIn;
+    if (q.length !== n) throw new Error('TrueHDR SR: ' + what + ' has ' + q.length + ' int8 values, expected ' + n);
+    var scales = decodeF16(wsB64, cout, what + ' scales');
+    var out = new Float32Array(n);
+    for (var co = 0; co < cout; co++) {
+      var s = scales[co], off = co * fanIn;
+      for (var j = 0; j < fanIn; j++) {
+        var v = q[off + j];
+        out[off + j] = (v > 127 ? v - 256 : v) * s;
+      }
+    }
+    return out;
+  }
 
   function f32ArrayToF16(arr) {
     var f = new Float32Array(1), u = new Uint32Array(f.buffer), out = new Uint16Array(arr.length);
@@ -94,7 +109,8 @@
       }
       var layer = {
         k: k, cin: cin, cout: cout, act: L.act, skip: skip,
-        w: decodeF16(L.w, cout * cin * k * k, lw + ' w'), b: decodeF16(L.b, cout, lw + ' b'),
+        w: L.wq ? decodeQ8(L.wq, L.ws, cout, cin * k * k, lw + ' wq') : decodeF16(L.w, cout * cin * k * k, lw + ' w'),
+        b: decodeF16(L.b, cout, lw + ' b'),
         alpha: L.act === 'prelu' ? decodeF16(L.alpha, cout, lw + ' alpha') : null,
         outC: L.act === 'crelu' ? 2 * cout : cout
       };

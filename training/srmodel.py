@@ -129,12 +129,20 @@ def to_export(model, **fields):
     return d
 
 
+def b64_q8(wq_b64, ws_b64, shape):
+    cout = shape[0]
+    q = np.frombuffer(base64.b64decode(wq_b64), dtype=np.int8).astype(np.float32).reshape(cout, -1)
+    s = np.frombuffer(base64.b64decode(ws_b64), dtype='<f2').astype(np.float32).reshape(cout, 1)
+    return torch.from_numpy((q * s).reshape(shape))
+
+
 def from_export(d):
     spec = [{k: L[k] for k in ('k', 'cin', 'cout', 'act', 'skip') if k in L} for L in d['layers']]
     m = SRNet(spec, d['base'])
     with torch.no_grad():
         for i, (L, conv) in enumerate(zip(d['layers'], m.convs)):
-            conv.weight.copy_(b64_f16(L['w'], conv.weight.shape))
+            w = b64_q8(L['wq'], L['ws'], conv.weight.shape) if 'wq' in L else b64_f16(L['w'], conv.weight.shape)
+            conv.weight.copy_(w)
             conv.bias.copy_(b64_f16(L['b'], conv.bias.shape))
             if L['act'] == 'prelu':
                 m.prelus[str(i)].weight.copy_(b64_f16(L['alpha'], (L['cout'],)))
