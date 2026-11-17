@@ -19,7 +19,9 @@ Instead of applying SDR contrast/saturation CSS filters, **TrueHDR** intercepts 
    - Only renders when new video frames arrive (`requestVideoFrameCallback`), using `0%` GPU when paused.
 
 ## Keyboard Shortcuts
-- `⌥H` (**Option + H**): Toggle TrueHDR on/off for the current site
+- `⌥M` (**Option + M**): Toggle TrueHDR master switch on/off
+- `⌥H` (**Option + H**): Toggle HDR tone-mapping on/off
+- `⌥U` (**Option + U**): Toggle AI upscaling on/off
 - `⌥S` (**Option + S**): Toggle Split-Screen comparison (`SDR | EDR`)
 
 ## Installing & Enabling in Safari

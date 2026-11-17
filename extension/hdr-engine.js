@@ -2338,29 +2338,28 @@
     });
   }
 
+  const SHORTCUTS = {
+    KeyM: ['TOGGLE_MASTER', () => `TrueHDR: ${!settings.enabled ? 'ON' : 'OFF'}`],
+    KeyH: ['TOGGLE_HDR', () => (!settings.hdrEnabled ? `HDR: ON (${settings.peakBoost.toFixed(1)}x EDR)` : 'HDR: OFF')],
+    KeyU: ['TOGGLE_UPSCALE', () => `Upscaling: ${!settings.upscaleEnabled ? 'ON' : 'OFF'}`],
+    KeyS: ['TOGGLE_SPLIT', () => `Split View: ${!settings.splitEnabled ? 'SDR | EDR' : 'OFF'}`]
+  };
+
   window.addEventListener(
     'keydown',
     (e) => {
       const tag = e.target && e.target.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target && e.target.isContentEditable)) return;
-      if (e.altKey && !e.metaKey && !e.ctrlKey && e.code === 'KeyH') {
-        e.preventDefault();
-        postToBridge('TOGGLE_SITE', {});
-        const nextOn = !settings.effectiveEnabled;
-        for (const inst of instances.values()) {
-          if (inst.video.videoWidth > 0) {
-            showHudToast(inst.video, nextOn ? `TrueHDR: ON (${settings.peakBoost.toFixed(1)}x EDR)` : 'TrueHDR: OFF');
-            break;
-          }
-        }
-      } else if (e.altKey && !e.metaKey && !e.ctrlKey && e.code === 'KeyS') {
-        e.preventDefault();
-        postToBridge('TOGGLE_SPLIT', {});
-        for (const inst of instances.values()) {
-          if (inst.video.videoWidth > 0) {
-            showHudToast(inst.video, !settings.splitEnabled ? 'Split View: SDR | EDR' : 'Split View: OFF');
-            break;
-          }
+      if (!e.altKey || e.metaKey || e.ctrlKey || e.shiftKey) return;
+      const entry = SHORTCUTS[e.code];
+      if (!entry) return;
+      e.preventDefault();
+      postToBridge(entry[0], {});
+      const msg = entry[1]();
+      for (const inst of instances.values()) {
+        if (inst.video.videoWidth > 0) {
+          showHudToast(inst.video, msg);
+          break;
         }
       }
     },

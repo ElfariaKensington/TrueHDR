@@ -74,6 +74,15 @@
     postToMain('SETTINGS', computeEffectiveSettings(cachedSettings));
   }
 
+  async function updateStoredSettings(mutate) {
+    try {
+      const res = await ext.storage.local.get('truehdrSettings');
+      const cur = migrateSettings(res?.truehdrSettings);
+      mutate(cur);
+      await ext.storage.local.set({ truehdrSettings: cur });
+    } catch (_) {}
+  }
+
   window.addEventListener('message', async (event) => {
     if (event.source !== window) return;
     const data = event.data;
@@ -90,9 +99,7 @@
     } else if (data.kind === 'TOGGLE_SITE') {
       const host = location.hostname || '';
       if (!host) return;
-      try {
-        const res = await ext.storage.local.get('truehdrSettings');
-        const cur = migrateSettings(res?.truehdrSettings);
+      await updateStoredSettings((cur) => {
         const disabledSites = { ...(cur.disabledSites || {}) };
         if (!cur.enabled) {
           cur.enabled = true;
@@ -103,25 +110,22 @@
           disabledSites[host] = true;
         }
         cur.disabledSites = disabledSites;
-        await ext.storage.local.set({ truehdrSettings: cur });
-      } catch (_) {}
+      });
+    } else if (data.kind === 'TOGGLE_MASTER') {
+      await updateStoredSettings((cur) => { cur.enabled = !cur.enabled; });
+    } else if (data.kind === 'TOGGLE_HDR') {
+      await updateStoredSettings((cur) => { cur.hdrEnabled = !cur.hdrEnabled; });
+    } else if (data.kind === 'TOGGLE_UPSCALE') {
+      await updateStoredSettings((cur) => { cur.upscaleEnabled = !cur.upscaleEnabled; });
     } else if (data.kind === 'TOGGLE_SPLIT') {
-      try {
-        const res = await ext.storage.local.get('truehdrSettings');
-        const cur = migrateSettings(res?.truehdrSettings);
-        cur.splitEnabled = !cur.splitEnabled;
-        await ext.storage.local.set({ truehdrSettings: cur });
-      } catch (_) {}
+      await updateStoredSettings((cur) => { cur.splitEnabled = !cur.splitEnabled; });
     } else if (data.kind === 'SET_SPLIT_POS') {
       const pos = data.payload && typeof data.payload.splitPos === 'number' ? data.payload.splitPos : null;
       if (pos === null || !isFinite(pos)) return;
-      try {
-        const res = await ext.storage.local.get('truehdrSettings');
-        const cur = migrateSettings(res?.truehdrSettings);
+      await updateStoredSettings((cur) => {
         cur.splitPos = Math.min(0.95, Math.max(0.05, Math.round(pos * 100) / 100));
         cachedSettings = cur;
-        await ext.storage.local.set({ truehdrSettings: cur });
-      } catch (_) {}
+      });
     }
   });
 
