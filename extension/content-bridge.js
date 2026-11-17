@@ -112,6 +112,16 @@
         cur.splitEnabled = !cur.splitEnabled;
         await ext.storage.local.set({ truehdrSettings: cur });
       } catch (_) {}
+    } else if (data.kind === 'SET_SPLIT_POS') {
+      const pos = data.payload && typeof data.payload.splitPos === 'number' ? data.payload.splitPos : null;
+      if (pos === null || !isFinite(pos)) return;
+      try {
+        const res = await ext.storage.local.get('truehdrSettings');
+        const cur = migrateSettings(res?.truehdrSettings);
+        cur.splitPos = Math.min(0.95, Math.max(0.05, Math.round(pos * 100) / 100));
+        cachedSettings = cur;
+        await ext.storage.local.set({ truehdrSettings: cur });
+      } catch (_) {}
     }
   });
 

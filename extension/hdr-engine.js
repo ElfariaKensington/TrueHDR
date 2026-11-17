@@ -1541,14 +1541,143 @@
       const twin = make();
       twin.setAttribute('data-truehdr-twin', '1');
       canvas.insertAdjacentElement('afterend', twin);
-      this.twin = { canvas: twin, ctx: twin.getContext('webgpu'), on: false, w: 0, h: 0 };
+      this.twin = { canvas: twin, ctx: twin.getContext('webgpu'), on: false, w: 0, h: 0, lastCfgMs: 0, rearm: 0 };
+      this.ensureSplitHandle();
       this.configuredWidth = 0;
       this.configuredHeight = 0;
       this.lastRectKey = '';
     }
 
-    // Called every frame and from a focus poll: switch between main and twin canvas.
-    updateFocusTwin() {
+    ensureSplitHandle() {
+      if (this.splitHandle && this.splitHandle.isConnected) return;
+      const anchor = (this.twin && this.twin.canvas) || this.canvas;
+      if (!anchor || !anchor.parentElement) return;
+      const h = document.createElement('div');
+      h.setAttribute('data-truehdr-split', '1');
+      Object.assign(h.style, {
+        position: 'absolute',
+        width: '28px',
+        marginLeft: '-14px',
+        cursor: 'ew-resize',
+        pointerEvents: 'auto',
+        touchAction: 'none',
+        userSelect: 'none',
+        webkitUserSelect: 'none',
+        background: 'transparent',
+        display: 'none'
+      });
+      const pill = document.createElement('div');
+      Object.assign(pill.style, {
+        position: 'absolute',
+        top: '50%',
+        left: '50%',
+        transform: 'translate(-50%, -50%)',
+        width: '20px',
+        height: '42px',
+        borderRadius: '999px',
+        background: 'rgba(14, 16, 24, 0.78)',
+        backdropFilter: 'blur(8px)',
+        WebkitBackdropFilter: 'blur(8px)',
+        border: '1px solid rgba(255, 255, 255, 0.65)',
+        boxShadow: '0 2px 10px rgba(0, 0, 0, 0.5)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        color: '#fff',
+        fontFamily: '-apple-system, BlinkMacSystemFont, sans-serif',
+        fontSize: '11px',
+        fontWeight: '700',
+        letterSpacing: '1px',
+        pointerEvents: 'none'
+      });
+      pill.textContent = '‹›';
+      h.appendChild(pill);
+
+      let dragging = false;
+      const updateFromEvent = (e) => {
+        if (!this.canvas) return;
+        const rect = this.canvas.getBoundingClientRect();
+        if (rect.width <= 0) return;
+        settings.splitPos = Math.min(0.95, Math.max(0.05, (e.clientX - rect.left) / rect.width));
+        this.syncSplitHandle();
+        this.renderFrame();
+      };
+      h.addEventListener('pointerdown', (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        dragging = true;
+        try { h.setPointerCapture(e.pointerId); } catch (_) {}
+        updateFromEvent(e);
+      });
+      h.addEventListener('pointermove', (e) => {
+        if (!dragging) return;
+        e.preventDefault();
+        e.stopPropagation();
+        updateFromEvent(e);
+      });
+      const stopDrag = (e) => {
+        if (!dragging) return;
+        dragging = false;
+        e.stopPropagation();
+        try { h.releasePointerCapture(e.pointerId); } catch (_) {}
+        postToBridge('SET_SPLIT_POS', { splitPos: settings.splitPos });
+      };
+      h.addEventListener('pointerup', stopDrag);
+      h.addEventListener('pointercancel', stopDrag);
+      for (const ev of ['mousedown', 'click', 'dblclick']) {
+        h.addEventListener(ev, (e) => e.stopPropagation());
+      }
+
+      anchor.insertAdjacentElement('afterend', h);
+      this.splitHandle = h;
+    }
+
+    syncSplitHandle() {
+      const h = this.splitHandle;
+      if (!h || !this.canvas) return;
+      if (!settings.splitEnabled || this.canvas.style.display === 'none' || !this.shouldRender()) {
+        if (h.style.display !== 'none') h.style.display = 'none';
+        return;
+      }
+      if (this.twin && this.twin.canvas && this.twin.canvas.parentElement && h.previousSibling !== this.twin.canvas) {
+        this.twin.canvas.insertAdjacentElement('afterend', h);
+      }
+      const left = parseFloat(this.canvas.style.left) || 0;
+      const top = parseFloat(this.canvas.style.top) || 0;
+      const w = parseFloat(this.canvas.style.width) || 0;
+      const ch = parseFloat(this.canvas.style.height) || 0;
+      if (w <= 0 || ch <= 0) {
+        h.style.display = 'none';
+        return;
+      }
+      const padTop = Math.min(20, ch * 0.06);
+      const padBot = Math.min(64, ch * 0.16);
+      const z = (parseInt(this.canvas.style.zIndex, 10) || 0) + 1;
+      h.style.left = `${left + settings.splitPos * w}px`;
+      h.style.top = `${top + padTop}px`;
+      h.style.height = `${Math.max(40, ch - padTop - padBot)}px`;
+      h.style.zIndex = String(z);
+      if (h.style.display !== 'block') h.style.display = 'block';
+    }
+
+    configureTwin() {
+      const tw = this.twin;
+      if (!tw || !this.canvas || gpuState.status !== 'ready') return false;
+      tw.canvas.width = this.canvas.width;
+      tw.canvas.height = this.canvas.height;
+      tw.w = this.canvas.width;
+      tw.h = this.canvas.height;
+      try {
+        tw.ctx.configure({ device: gpuState.device, format: 'rgba16float', colorSpace: 'display-p3', toneMapping: { mode: 'extended' }, alphaMode: 'premultiplied' });
+      } catch (_) { return false; }
+      tw.lastCfgMs = performance.now();
+      return true;
+    }
+
+    // Called every frame and from the focus poll/events: switch between main and twin canvas,
+    // and re-configure the twin after WebKit's screenPropertiesChanged suppression arrives.
+    updateFocusTwin(fromRender = false) {
       const tw = this.twin;
       if (!tw || !this.canvas || gpuState.status !== 'ready') return;
       if (this.canvas.parentElement && tw.canvas.previousSibling !== this.canvas) {
@@ -1560,24 +1689,27 @@
           if (tw.canvas.style[k] !== this.canvas.style[k]) tw.canvas.style[k] = this.canvas.style[k];
         }
       }
-      if (want === tw.on && (!want || (tw.w === this.canvas.width && tw.h === this.canvas.height))) return;
+      const now = performance.now();
+      const sizeChanged = want && (tw.w !== this.canvas.width || tw.h !== this.canvas.height);
+      const needPeriodic = !fromRender && want && tw.on && (now - tw.lastCfgMs) >= (tw.rearm > 0 ? 450 : 2000);
+      if (want === tw.on && !sizeChanged && !needPeriodic) return;
       if (want) {
-        tw.canvas.width = this.canvas.width;
-        tw.canvas.height = this.canvas.height;
-        tw.w = this.canvas.width;
-        tw.h = this.canvas.height;
-        try {
-          tw.ctx.configure({ device: gpuState.device, format: 'rgba16float', colorSpace: 'display-p3', toneMapping: { mode: 'extended' }, alphaMode: 'premultiplied' });
-        } catch (_) { return; }
+        const turningOn = !tw.on;
+        if (!this.configureTwin()) return;
+        if (turningOn) tw.rearm = 2;
+        else if (tw.rearm > 0) tw.rearm--;
         for (const k of ['left', 'top', 'width', 'height', 'zIndex', 'borderRadius']) tw.canvas.style[k] = this.canvas.style[k];
         tw.canvas.style.display = 'block';
+        this.canvas.style.visibility = 'hidden';
         tw.on = true;
       } else {
         tw.on = false;
+        tw.rearm = 0;
         tw.canvas.style.display = 'none';
+        this.canvas.style.visibility = 'visible';
         try { tw.ctx.unconfigure(); } catch (_) {}
       }
-      this.scheduleRenderOnce();
+      if (!fromRender) this.renderFrame();
     }
 
     reconfigure() {
@@ -1727,6 +1859,7 @@
           this.canvas.style.display = 'none';
         }
         this.updateFocusTwin();
+        this.syncSplitHandle();
         if (this.isActive) {
           this.isActive = false;
           broadcastStatus();
@@ -1740,6 +1873,7 @@
           this.canvas.style.display = 'none';
         }
         this.updateFocusTwin();
+        this.syncSplitHandle();
         if (this.isActive) {
           this.isActive = false;
           broadcastStatus();
@@ -1798,6 +1932,7 @@
       if (this.canvas.style.display !== 'block') {
         this.canvas.style.display = 'block';
       }
+      this.syncSplitHandle();
       if (!this.isActive || upscalingChanged) {
         this.isActive = true;
         broadcastStatus();
@@ -1937,7 +2072,7 @@
       }
 
       let swapTex;
-      this.updateFocusTwin();
+      this.updateFocusTwin(true);
       const outCtx = this.twin && this.twin.on ? this.twin.ctx : this.ctx;
       try {
         swapTex = outCtx.getCurrentTexture();
@@ -2121,6 +2256,9 @@
       }
       if (this.twin && this.twin.canvas.parentElement) {
         this.twin.canvas.remove();
+      }
+      if (this.splitHandle && this.splitHandle.parentElement) {
+        this.splitHandle.remove();
       }
       this.releaseGpu();
       instances.delete(this.video);
@@ -2339,6 +2477,7 @@
       for (const inst of instances.values()) {
         if (srCfgChanged) inst.resetSRGuard();
         inst.syncOverlayLayout(needsLayout);
+        inst.syncSplitHandle();
         if (settings.effectiveEnabled) {
           if (needsLayout) {
             inst.renderFrame();
