@@ -1516,32 +1516,20 @@
       const parent = this.video.parentElement;
       if (!parent) return;
 
-      const make = () => {
-        const c = document.createElement('canvas');
-        c.setAttribute('data-truehdr', '1');
-        Object.assign(c.style, {
-          position: 'absolute',
-          pointerEvents: 'none',
-          margin: '0',
-          padding: '0',
-          border: '0',
-          background: 'transparent',
-          display: 'none'
-        });
-        return c;
-      };
-      const canvas = make();
+      const canvas = document.createElement('canvas');
+      canvas.setAttribute('data-truehdr', '1');
+      Object.assign(canvas.style, {
+        position: 'absolute',
+        pointerEvents: 'none',
+        margin: '0',
+        padding: '0',
+        border: '0',
+        background: 'transparent',
+        display: 'none'
+      });
       this.video.insertAdjacentElement('afterend', canvas);
       this.canvas = canvas;
       this.ctx = canvas.getContext('webgpu');
-      // Focus workaround (dev/focus-test): while Safari is inactive WebKit clamps the headroom of
-      // existing HDR layers to 1.6x. A context configured *after* focus is lost gets fresh
-      // swap-chain surfaces without that clamp (~4.9x). So we render into a twin canvas that is
-      // configured on focus loss, and go back to the original (full 8.8x again) on focus.
-      const twin = make();
-      twin.setAttribute('data-truehdr-twin', '1');
-      canvas.insertAdjacentElement('afterend', twin);
-      this.twin = { canvas: twin, ctx: twin.getContext('webgpu'), on: false, w: 0, h: 0, lastCfgMs: 0, rearm: 0 };
       this.ensureSplitHandle();
       this.configuredWidth = 0;
       this.configuredHeight = 0;
@@ -1550,7 +1538,7 @@
 
     ensureSplitHandle() {
       if (this.splitHandle && this.splitHandle.isConnected) return;
-      const anchor = (this.twin && this.twin.canvas) || this.canvas;
+      const anchor = this.canvas;
       if (!anchor || !anchor.parentElement) return;
       const h = document.createElement('div');
       h.setAttribute('data-truehdr-split', '1');
@@ -1640,8 +1628,8 @@
         if (h.style.display !== 'none') h.style.display = 'none';
         return;
       }
-      if (this.twin && this.twin.canvas && this.twin.canvas.parentElement && h.previousSibling !== this.twin.canvas) {
-        this.twin.canvas.insertAdjacentElement('afterend', h);
+      if (this.canvas.parentElement && h.previousSibling !== this.canvas) {
+        this.canvas.insertAdjacentElement('afterend', h);
       }
       const left = parseFloat(this.canvas.style.left) || 0;
       const top = parseFloat(this.canvas.style.top) || 0;
@@ -1659,57 +1647,6 @@
       h.style.height = `${Math.max(40, ch - padTop - padBot)}px`;
       h.style.zIndex = String(z);
       if (h.style.display !== 'block') h.style.display = 'block';
-    }
-
-    configureTwin() {
-      const tw = this.twin;
-      if (!tw || !this.canvas || gpuState.status !== 'ready') return false;
-      tw.canvas.width = this.canvas.width;
-      tw.canvas.height = this.canvas.height;
-      tw.w = this.canvas.width;
-      tw.h = this.canvas.height;
-      try {
-        tw.ctx.unconfigure();
-        tw.ctx.configure({ device: gpuState.device, format: 'rgba16float', colorSpace: 'display-p3', toneMapping: { mode: 'extended' }, alphaMode: 'premultiplied' });
-      } catch (_) { return false; }
-      tw.lastCfgMs = performance.now();
-      return true;
-    }
-
-    // Called every frame and from the focus poll/events: switch between main and twin canvas,
-    // and re-configure the twin once after WebKit's screenPropertiesChanged suppression arrives.
-    updateFocusTwin(fromRender = false) {
-      const tw = this.twin;
-      if (!tw || !this.canvas || gpuState.status !== 'ready') return;
-      if (this.canvas.parentElement && tw.canvas.previousSibling !== this.canvas) {
-        this.canvas.insertAdjacentElement('afterend', tw.canvas);
-      }
-      const want = !document.hasFocus() && this.canvas.style.display !== 'none';
-      if (want && tw.on) {
-        for (const k of ['left', 'top', 'width', 'height', 'zIndex', 'borderRadius']) {
-          if (tw.canvas.style[k] !== this.canvas.style[k]) tw.canvas.style[k] = this.canvas.style[k];
-        }
-      }
-      const now = performance.now();
-      const sizeChanged = want && (tw.w !== this.canvas.width || tw.h !== this.canvas.height);
-      const needRearm = !fromRender && want && tw.on && tw.rearm > 0 && (now - tw.lastCfgMs) >= 450;
-      if (want === tw.on && !sizeChanged && !needRearm) return;
-      if (want) {
-        const turningOn = !tw.on;
-        if (!this.configureTwin()) return;
-        tw.rearm = turningOn ? 1 : 0;
-        for (const k of ['left', 'top', 'width', 'height', 'zIndex', 'borderRadius']) tw.canvas.style[k] = this.canvas.style[k];
-        tw.canvas.style.display = 'block';
-        this.canvas.style.visibility = 'hidden';
-        tw.on = true;
-      } else {
-        tw.on = false;
-        tw.rearm = 0;
-        tw.canvas.style.display = 'none';
-        this.canvas.style.visibility = 'visible';
-        try { tw.ctx.unconfigure(); } catch (_) {}
-      }
-      if (!fromRender) this.renderFrame();
     }
 
     reconfigure() {
@@ -1858,7 +1795,6 @@
         if (this.canvas.style.display !== 'none') {
           this.canvas.style.display = 'none';
         }
-        this.updateFocusTwin();
         this.syncSplitHandle();
         if (this.isActive) {
           this.isActive = false;
@@ -1872,7 +1808,6 @@
         if (this.canvas.style.display !== 'none') {
           this.canvas.style.display = 'none';
         }
-        this.updateFocusTwin();
         this.syncSplitHandle();
         if (this.isActive) {
           this.isActive = false;
@@ -2072,12 +2007,9 @@
       }
 
       let swapTex;
-      this.updateFocusTwin(true);
-      const outCtx = this.twin && this.twin.on ? this.twin.ctx : this.ctx;
       try {
-        swapTex = outCtx.getCurrentTexture();
+        swapTex = this.ctx.getCurrentTexture();
       } catch (_) {
-        if (outCtx !== this.ctx) return;
         this.reconfigure();
         try {
           swapTex = this.ctx.getCurrentTexture();
@@ -2258,10 +2190,6 @@
       if (this.canvas && this.canvas.parentElement) {
         this.canvas.remove();
       }
-      if (this.twin) {
-        try { this.twin.ctx.unconfigure(); } catch (_) {}
-        if (this.twin.canvas.parentElement) this.twin.canvas.remove();
-      }
       if (this.splitHandle && this.splitHandle.parentElement) {
         this.splitHandle.remove();
       }
@@ -2391,13 +2319,6 @@
     },
     true
   );
-
-  // Focus twin canvas switching (see updateFocusTwin): events when web content had focus,
-  // plus a cheap poll for the cases where blur/focus never reach the page.
-  const refreshTwins = () => { for (const inst of instances.values()) inst.updateFocusTwin(); };
-  window.addEventListener('blur', refreshTwins);
-  window.addEventListener('focus', refreshTwins);
-  setInterval(() => { if (instances.size) refreshTwins(); }, 500);
 
   window.addEventListener('yt-navigate-finish', () => {
     setTimeout(() => {
