@@ -13,26 +13,38 @@
     gamutBoost: 0.45,
     shadowDepth: 0.14,
     aplGuard: 0.45,
-    upscaleMode: 'auto',
-    upscaleSharpness: 0.55,
+    upscaleQuality: 'quality',
+    upscaleContent: 'live',
+    upscaleSharpness: 0.25,
     bypassNativeHdr: true,
     splitEnabled: false,
     splitPos: 0.5,
-    disabledSites: {}
+    disabledSites: {},
+    settingsVersion: 2
   };
 
-  let cachedSettings = { ...DEFAULT_SETTINGS };
+  function migrateSettings(raw) {
+    const merged = { ...DEFAULT_SETTINGS, ...(raw || {}) };
+    const legacy = !raw || raw.settingsVersion !== DEFAULT_SETTINGS.settingsVersion;
+    // Legacy 'upscaleMode': only 'off' carries meaning (auto/4k targets are gone).
+    if (merged.upscaleMode === 'off' && (!raw || typeof raw.upscaleEnabled !== 'boolean')) {
+      merged.upscaleEnabled = false;
+    }
+    delete merged.upscaleMode;
+    // Sharpness is now an optional post-sharpen on top of AI SR: old default 0.55 -> 0.25.
+    if (legacy && raw && raw.upscaleSharpness === 0.55) merged.upscaleSharpness = 0.25;
+    if (merged.upscaleQuality !== 'fast' && merged.upscaleQuality !== 'quality') merged.upscaleQuality = DEFAULT_SETTINGS.upscaleQuality;
+    if (merged.upscaleContent !== 'live' && merged.upscaleContent !== 'anime') merged.upscaleContent = DEFAULT_SETTINGS.upscaleContent;
+    merged.settingsVersion = DEFAULT_SETTINGS.settingsVersion;
+    return merged;
+  }
+
+  let cachedSettings = migrateSettings(null);
   let lastStatus = null;
   let engineReady = false;
 
   function computeEffectiveSettings(raw) {
-    const merged = { ...DEFAULT_SETTINGS, ...(raw || {}) };
-    if (merged.upscaleMode === 'off') {
-      if (!raw || typeof raw.upscaleEnabled !== 'boolean') {
-        merged.upscaleEnabled = false;
-      }
-      merged.upscaleMode = 'auto';
-    }
+    const merged = migrateSettings(raw);
     const host = location.hostname || '';
     const siteDisabled = Boolean(merged.disabledSites && merged.disabledSites[host]);
     const siteActive = Boolean(merged.enabled && !siteDisabled);
@@ -55,9 +67,9 @@
   async function loadAndPushSettings() {
     try {
       const res = await ext.storage.local.get('truehdrSettings');
-      cachedSettings = { ...DEFAULT_SETTINGS, ...(res?.truehdrSettings || {}) };
+      cachedSettings = migrateSettings(res?.truehdrSettings);
     } catch (_) {
-      cachedSettings = { ...DEFAULT_SETTINGS };
+      cachedSettings = migrateSettings(null);
     }
     postToMain('SETTINGS', computeEffectiveSettings(cachedSettings));
   }
@@ -80,7 +92,7 @@
       if (!host) return;
       try {
         const res = await ext.storage.local.get('truehdrSettings');
-        const cur = { ...DEFAULT_SETTINGS, ...(res?.truehdrSettings || {}) };
+        const cur = migrateSettings(res?.truehdrSettings);
         const disabledSites = { ...(cur.disabledSites || {}) };
         if (!cur.enabled) {
           cur.enabled = true;
@@ -96,7 +108,7 @@
     } else if (data.kind === 'TOGGLE_SPLIT') {
       try {
         const res = await ext.storage.local.get('truehdrSettings');
-        const cur = { ...DEFAULT_SETTINGS, ...(res?.truehdrSettings || {}) };
+        const cur = migrateSettings(res?.truehdrSettings);
         cur.splitEnabled = !cur.splitEnabled;
         await ext.storage.local.set({ truehdrSettings: cur });
       } catch (_) {}
@@ -105,7 +117,7 @@
 
   ext.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local' || !changes.truehdrSettings) return;
-    cachedSettings = { ...DEFAULT_SETTINGS, ...(changes.truehdrSettings.newValue || {}) };
+    cachedSettings = migrateSettings(changes.truehdrSettings.newValue);
     postToMain('SETTINGS', computeEffectiveSettings(cachedSettings));
   });
 

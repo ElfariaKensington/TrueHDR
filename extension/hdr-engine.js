@@ -1,64 +1,82 @@
 (() => {
-  if (window.__TRUEHDR_ENGINE_LOADED__) return;
-  window.__TRUEHDR_ENGINE_LOADED__ = true;
+  const G = globalThis;
+  if (G.__TRUEHDR_ENGINE_LOADED__) return;
+  G.__TRUEHDR_ENGINE_LOADED__ = true;
 
-  const CHANNEL = '__TRUEHDR_BRIDGE_V1__';
+  // ---------------------------------------------------------------------------
+  // GPU core (DOM-free; also loaded by the dev/harness benchmarks under Deno)
+  //
+  // Per new video frame:
+  //   compute: analyze  - one invocation per 8x8 cell: 16 bilinear taps (= exact 2x2 box means),
+  //                       writes (mean linear luma, robust (median-of-medians) log2 brightness,
+  //                       strong-edge density, native-HDR fraction) + per-workgroup partials
+  //            stats    - 1 workgroup: area-averaged APL, 32-bin histogram, scene-cut test,
+  //                       asymmetric temporal smoothing, effective peak -> 176 B state buffer,
+  //                       and a 256-entry tone LUT over log2 brightness (global curve terms)
+  //            map      - per cell: robust (median-of-9 + range-weighted) log2 background,
+  //                       caption/text-region score, temporal smoothing with scene-cut reset
+  //   render:  final    - one pass at the canvas resolution: source sample, edge-aware 2x2 slice
+  //                       of the 1/8-res map, inverse tone mapping, Display-P3, dither
+  //   upscale path adds: decode (external -> rgba16float R'G'B' at source res), SR 2x (x1/x2),
+  //                       and the final pass resamples the SR result (or runs EASU+RCAS fallback).
+  // ---------------------------------------------------------------------------
 
-  const DEFAULT_SETTINGS = {
-    enabled: true,
-    hdrEnabled: true,
-    upscaleEnabled: true,
-    preset: 'vivid',
-    peakBoost: 6.0,
-    threshold: 0.46,
-    localPunch: 0.70,
-    gamutBoost: 0.45,
-    shadowDepth: 0.14,
-    aplGuard: 0.45,
-    upscaleMode: 'auto',      // 'auto' | '4k'
-    upscaleSharpness: 0.55,   // 0.0 .. 1.0
-    bypassNativeHdr: true,
-    splitEnabled: false,
-    splitPos: 0.5,
-    effectiveHdr: true,
-    effectiveUpscale: true,
-    effectiveEnabled: true
-  };
+  const CELL = 8;
+  const FRAME_U_FLOATS = 28; // 7 x vec4f
+  const STATE_BYTES = 176;   // see struct State
+  const PARTIAL_BYTES = 144; // see struct Partial
 
-  let settings = { ...DEFAULT_SETTINGS };
-  let isEdrDisplay = window.matchMedia('(dynamic-range: high)').matches;
-  let gpuState = {
-    status: 'init', // 'init' | 'ready' | 'unsupported' | 'error'
-    device: null,
-    sampler: null,
-    copyPipeline: null,
-    restorePipeline: null,
-    reducePipeline: null,
-    hdrPipeline: null,
-    initPromise: null,
-    errorMsg: null
-  };
+  const WGSL_COMMON = /* wgsl */ `
+    fn srgbToLinear(c: vec3f) -> vec3f {
+      let lo = c / 12.92;
+      let hi = pow(max((c + 0.055) / 1.055, vec3f(0.0)), vec3f(2.4));
+      return select(hi, lo, c <= vec3f(0.04045));
+    }
 
-  const instances = new Map(); // HTMLVideoElement -> VideoHDRProcessor
+    // Decoded R'G'B' -> linear light. Pixels already above SDR white (native PQ/HLG decoded to
+    // extended range) are treated as linear.
+    fn decodeLinear(raw: vec3f) -> vec3f {
+      let r = max(raw, vec3f(0.0));
+      return select(srgbToLinear(r), r, max(r.r, max(r.g, r.b)) > 1.02);
+    }
 
-  function postToBridge(kind, payload) {
-    window.postMessage({ channel: CHANNEL, from: 'engine', kind, payload }, '*');
-  }
+    fn luma709(c: vec3f) -> f32 {
+      return dot(max(c, vec3f(0.0)), vec3f(0.2126, 0.7152, 0.0722));
+    }
 
-  // Listen for dynamic range changes (e.g., moving window between XDR and external SDR monitor)
-  try {
-    const mq = window.matchMedia('(dynamic-range: high)');
-    mq.addEventListener('change', (e) => {
-      isEdrDisplay = e.matches;
-      for (const inst of instances.values()) {
-        inst.reconfigure();
-        inst.scheduleRenderOnce();
-      }
-      broadcastStatus();
-    });
-  } catch (_) {}
+    struct FrameU {
+      rect: vec4f,   // content rect in canvas uv (ox, oy, w, h)
+      tone: vec4f,   // peakBoost, threshold, localPunch, gamutBoost
+      extra: vec4f,  // shadowDepth, aplGuard, splitPos (<0 = off), flags (1 = HDR, 2 = bypass native HDR)
+      info: vec4f,   // srcW, srcH, frameSeed, reset
+      res: vec4f,    // resample texture W, H, sharpness, unused
+      outp: vec4f,   // content output W, H (canvas px), map uv scale x, y
+      stat: vec4f,   // APL alpha up, APL alpha down, map alpha (also text attack), text alpha release
+    };
 
-  // WGSL Shaders
+    // First vec4 is copied to the final pass each frame (SceneU)
+    struct State {
+      apl: f32, hdrFrac: f32, effPeak: f32, textCap: f32,
+      aplRaw: f32, cut: f32, histDist: f32, frames: f32,
+      p50: f32, p98: f32, pad0: f32, pad1: f32,
+      hist: array<f32, 32>,
+    };
+
+    // Per analysis workgroup (8x8 cells): sum of cell mean luma, native-HDR fraction, cell count,
+    // and a 32-bin histogram of cell mean luma (perceptual axis)
+    struct Partial {
+      sumY: f32, hdr: f32, n: f32, pad: f32,
+      hist: array<u32, 32>,
+    };
+  `;
+
+  // The only texture_external user code. Harness builds substitute texture_2d<f32> and add the
+  // mip argument to the single textureLoad below; everything else is identical.
+  const WGSL_VIDEO = /* wgsl */ `
+    @group(0) @binding(0) var vidTex: texture_external;
+    fn loadVid(p: vec2i) -> vec4f { return textureLoad(vidTex, p); }
+  `;
+
   const FULLSCREEN_VS = /* wgsl */ `
     struct VSOut {
       @builtin(position) pos: vec4f,
@@ -80,214 +98,312 @@
     }
   `;
 
-  // Pass 0: Single external texture YUV->RGB decode + linearize at native video resolution (1 tap per source pixel)
-  const COPY_SRC_FS = /* wgsl */ `
-    @group(0) @binding(0) var samp: sampler;
-    @group(0) @binding(1) var vidTex: texture_external;
+  // Analysis: one invocation per 8x8-pixel cell. Each of the 16 taps is a bilinear sample at the
+  // shared corner of a 2x2 pixel quad, i.e. an exact 2x2 box average, so every source pixel is
+  // covered once at 1/4 of the fetches. Area statistics therefore move continuously as small
+  // objects move (no point-sample jumps). Workgroup partial sums feed the global stats pass.
+  // ANALYZE_LOAD_CS is a textureLoad-only variant, used only if a WebGPU implementation rejects
+  // textureSampleBaseClampToEdge on texture_external in compute.
+  function analyzeSource(sampled) {
+    const tap = sampled
+      ? 'textureSampleBaseClampToEdge(vidTex, samp, (base + o) * inv).rgb'
+      : '0.25 * (loadVid(min(pq, mxp)).rgb + loadVid(min(pq + vec2i(1, 0), mxp)).rgb + loadVid(min(pq + vec2i(0, 1), mxp)).rgb + loadVid(min(pq + vec2i(1, 1), mxp)).rgb)';
+    return /* wgsl */ `
+    ${WGSL_COMMON}
+    ${WGSL_VIDEO}
+    @group(1) @binding(0) var cellOut: texture_storage_2d<rgba16float, write>;
+    @group(1) @binding(1) var samp: sampler;
+    @group(1) @binding(2) var<storage, read_write> partials: array<Partial>;
 
-    fn srgbToLinear(c: vec3f) -> vec3f {
-      let lo = c / 12.92;
-      let hi = pow(max((c + 0.055) / 1.055, vec3f(0.0)), vec3f(2.4));
-      return select(hi, lo, c <= vec3f(0.04045));
+    var<workgroup> wAcc: array<atomic<u32>, 3>;  // fixed point (x1024): sum cell luma, sum HDR fraction; cell count
+    var<workgroup> wHist: array<atomic<u32>, 32>;
+
+    fn med4(a: f32, b: f32, c: f32, d: f32) -> f32 {
+      return 0.5 * (a + b + c + d - min(min(a, b), min(c, d)) - max(max(a, b), max(c, d)));
     }
 
-    @fragment
-    fn fsMain(@location(0) uv: vec2f) -> @location(0) vec4f {
-      let raw = max(textureSampleBaseClampToEdge(vidTex, samp, uv).rgb, vec3f(0.0));
-      let maxRaw = max(raw.r, max(raw.g, raw.b));
-      let lin = select(srgbToLinear(raw), raw, maxRaw > 1.02);
-      // Store maxRaw in alpha to detect native PQ/HLG frames with zero extra reads
-      return vec4f(lin, maxRaw);
+    @compute @workgroup_size(8, 8, 1)
+    fn csAnalyze(
+      @builtin(global_invocation_id) gid: vec3u,
+      @builtin(workgroup_id) wid: vec3u,
+      @builtin(num_workgroups) nwg: vec3u,
+      @builtin(local_invocation_index) li: u32
+    ) {
+      let dims = vec2i(textureDimensions(vidTex));
+      let cells = (dims + vec2i(7)) / 8;
+      let valid = i32(gid.x) < cells.x && i32(gid.y) < cells.y;
+      if (li < 32u) { atomicStore(&wHist[li], 0u); }
+      if (li < 3u) { atomicStore(&wAcc[li], 0u); }
+      workgroupBarrier();
+
+      if (valid) {
+        let inv = 1.0 / vec2f(dims);
+        let base = vec2f(gid.xy) * 8.0 + vec2f(1.0);
+        let mxp = dims - vec2i(1);
+        var q: array<f32, 16>;
+        var pv: array<f32, 16>;
+        var sumY = 0.0;
+        var hdr = 0.0;
+        for (var i = 0; i < 16; i = i + 1) {
+          let o = vec2f(f32(i % 4), f32(i / 4)) * 2.0;
+          let pq = vec2i(gid.xy) * 8 + vec2i(o);
+          let raw = max(${tap}, vec3f(0.0));
+          let mx = max(raw.r, max(raw.g, raw.b));
+          let lin = decodeLinear(raw);
+          let Y = luma709(lin);
+          sumY = sumY + Y;
+          hdr = hdr + select(0.0, 1.0, mx > 1.03);
+          q[i] = log2(max(mix(Y, max(lin.r, max(lin.g, lin.b)), 0.46), 1.0 / 16384.0));
+          pv[i] = mix(luma709(raw), mx, 0.46);
+        }
+        // Strong perceptual transitions between neighbouring quads (24 pairs)
+        var edges = 0.0;
+        for (var r = 0; r < 4; r = r + 1) {
+          for (var c = 0; c < 3; c = c + 1) {
+            edges = edges + step(0.22, abs(pv[r * 4 + c] - pv[r * 4 + c + 1]));
+            edges = edges + step(0.22, abs(pv[c * 4 + r] - pv[c * 4 + r + 4]));
+          }
+        }
+        // Robust cell level: median of the four 4x4-pixel group medians (median-of-4 = mean of the
+        // middle two). Rejects small objects (birds, specks) whatever their contrast.
+        let g0 = med4(q[0], q[1], q[4], q[5]);
+        let g1 = med4(q[2], q[3], q[6], q[7]);
+        let g2 = med4(q[8], q[9], q[12], q[13]);
+        let g3 = med4(q[10], q[11], q[14], q[15]);
+        let cellY = sumY / 16.0;
+        textureStore(cellOut, vec2i(gid.xy), vec4f(cellY, med4(g0, g1, g2, g3), edges / 24.0, hdr / 16.0));
+        atomicAdd(&wHist[min(u32(pow(cellY, 1.0 / 2.2) * 32.0), 31u)], 1u);
+        atomicAdd(&wAcc[0], u32(round(min(cellY, 16.0) * 1024.0)));
+        atomicAdd(&wAcc[1], u32(round(hdr * 64.0)));
+        atomicAdd(&wAcc[2], 1u);
+      }
+      workgroupBarrier();
+      let wi = wid.y * nwg.x + wid.x;
+      if (li == 0u) {
+        partials[wi].sumY = f32(atomicLoad(&wAcc[0])) / 1024.0;
+        partials[wi].hdr = f32(atomicLoad(&wAcc[1])) / 1024.0;
+        partials[wi].n = f32(atomicLoad(&wAcc[2]));
+      }
+      if (li < 32u) { partials[wi].hist[li] = atomicLoad(&wHist[li]); }
+    }
+  `;
+  }
+  const ANALYZE_CS = analyzeSource(true);
+  const ANALYZE_LOAD_CS = analyzeSource(false);
+
+  // Global statistics: one workgroup reduces the analysis partials, then writes the per-frame
+  // 256-entry tone LUT indexed by log2(E): (global EDR gain, highlight-weight, saturation term).
+  const LUT_L0 = -8.0;
+  const LUT_L1 = 0.5;
+  const STATS_CS = /* wgsl */ `
+    ${WGSL_COMMON}
+    @group(0) @binding(0) var<storage, read> partials: array<Partial>;
+    @group(0) @binding(1) var<storage, read_write> st: State;
+    @group(0) @binding(2) var<uniform> u: FrameU;
+    @group(0) @binding(3) var lutOut: texture_storage_2d<rgba16float, write>;
+
+    var<workgroup> aSum: array<atomic<u32>, 4>;  // fixed point: sum luma, sum HDR, cell count, hist distance
+    var<workgroup> aHist: array<atomic<u32>, 32>;
+    var<workgroup> sPeak: f32;
+
+    @compute @workgroup_size(256, 1, 1)
+    fn csStats(@builtin(local_invocation_index) li: u32) {
+      if (li < 32u) { atomicStore(&aHist[li], 0u); }
+      if (li < 4u) { atomicStore(&aSum[li], 0u); }
+      workgroupBarrier();
+
+      let n = arrayLength(&partials);
+      // Each partial carries <= 64 cells x 16 luma; keep the u32 sum below 2^32
+      let scale = clamp(exp2(floor(log2(4.0e6 / f32(max(n, 1u))))), 16.0, 1024.0);
+      var sy = 0.0;
+      var sh = 0.0;
+      var sn = 0.0;
+      for (var i = li; i < n; i = i + 256u) {
+        sy = sy + partials[i].sumY;
+        sh = sh + partials[i].hdr;
+        sn = sn + partials[i].n;
+      }
+      var hc = 0u;
+      for (var i = li / 32u; i < n; i = i + 8u) {
+        hc = hc + partials[i].hist[li % 32u];
+      }
+      atomicAdd(&aSum[0], u32(round(sy * scale)));
+      atomicAdd(&aSum[1], u32(round(sh * scale)));
+      atomicAdd(&aSum[2], u32(round(sn)));
+      atomicAdd(&aHist[li % 32u], hc);
+      workgroupBarrier();
+
+      let cells = max(f32(atomicLoad(&aSum[2])), 1.0);
+      if (li < 32u) {
+        let h = f32(atomicLoad(&aHist[li])) / cells;
+        atomicAdd(&aSum[3], u32(round(abs(h - st.hist[li]) * 65536.0)));
+        st.hist[li] = h;
+      }
+      workgroupBarrier();
+
+      if (li == 0u) {
+        let aplRaw = f32(atomicLoad(&aSum[0])) / (scale * cells);
+        let hdrRaw = f32(atomicLoad(&aSum[1])) / (scale * cells);
+        let dist = f32(atomicLoad(&aSum[3])) / 65536.0;
+        let cut = st.frames < 0.5 || u.info.w > 0.5 || dist > 0.6 || abs(aplRaw - st.aplRaw) > 0.15;
+        // Brightening is tracked fast (white-screen guard engages quickly), darkening slowly.
+        let a = select(u.stat.y, u.stat.x, aplRaw > st.apl);
+        let apl = select(mix(st.apl, aplRaw, a), aplRaw, cut);
+        st.apl = apl;
+        st.hdrFrac = select(mix(st.hdrFrac, hdrRaw, u.stat.x), hdrRaw, cut);
+        // White-screen APL guard -> effective peak; text cap for protected strokes
+        let aplAtten = 1.0 - u.extra.y * smoothstep(0.45, 0.88, apl);
+        let effPeak = 1.0 + (u.tone.x - 1.0) * clamp(aplAtten, 0.45, 1.0);
+        st.effPeak = effPeak;
+        st.textCap = max(1.65, effPeak * 0.32);
+        st.aplRaw = aplRaw;
+        st.cut = select(0.0, 1.0, cut);
+        st.histDist = dist;
+        var cum = 0.0;
+        var p50 = 1.0;
+        var p98 = 1.0;
+        var got50 = false;
+        var got98 = false;
+        for (var b = 0u; b < 32u; b = b + 1u) {
+          cum = cum + f32(atomicLoad(&aHist[b])) / cells;
+          if (!got50 && cum >= 0.5) { p50 = (f32(b) + 1.0) / 32.0; got50 = true; }
+          if (!got98 && cum >= 0.98) { p98 = (f32(b) + 1.0) / 32.0; got98 = true; }
+        }
+        st.p50 = p50;
+        st.p98 = p98;
+        st.frames = min(st.frames + 1.0, 1000000.0);
+        sPeak = effPeak;
+      }
+      workgroupBarrier();
+
+      // Tone LUT entry li at L = log2(E)
+      let L = ${LUT_L0.toFixed(1)} + ${(LUT_L1 - LUT_L0).toFixed(1)} * (f32(li) + 0.5) / 256.0;
+      let E = exp2(L);
+      let Ep = exp2(L * (1.0 / 2.2));
+      let knee = clamp(u.tone.y, 0.15, 0.88);
+      var gain = 1.0;
+      if (Ep > knee) {
+        // EDR highlight curve above the perceptual knee
+        let t = clamp((Ep - knee) / max(1.0 - knee, 0.05), 0.0, 1.0);
+        let smoothRamp = t * t * (3.0 - 2.0 * t);
+        let fastRamp = pow(t, 0.85);
+        gain = 1.0 + (sPeak - 1.0) * mix(smoothRamp, fastRamp, 0.55);
+      }
+      textureStore(lutOut, vec2i(i32(li), 0), vec4f(gain, smoothstep(0.10, 0.62, E), u.tone.w * 0.35 * smoothstep(0.06, 0.70, E), 1.0));
     }
   `;
 
-  // Pass 1: 1x1 Temporal EMA reduction over a 16x12 sparse grid directly from linearized srcTex
-  const REDUCE_FS = /* wgsl */ `
-    struct Uniforms {
-      rect: vec4f,
-      tone: vec4f,
-      extra: vec4f,
-      videoInfo: vec4f,
-      upscale: vec4f,
-    };
+  // Local adaptation map at cell resolution (8x8 cells per workgroup, 14x10 shared tile).
+  const MAP_CS = /* wgsl */ `
+    ${WGSL_COMMON}
+    @group(0) @binding(0) var cellTex: texture_2d<f32>;
+    @group(0) @binding(1) var prevMap: texture_2d<f32>;
+    @group(0) @binding(2) var mapOut: texture_storage_2d<rgba16float, write>;
+    @group(0) @binding(3) var<storage, read> st: State;
+    @group(0) @binding(4) var<uniform> u: FrameU;
 
-    @group(0) @binding(0) var srcTex: texture_2d<f32>;
-    @group(0) @binding(1) var prevStateTex: texture_2d<f32>;
-    @group(0) @binding(2) var<uniform> u: Uniforms;
+    var<workgroup> tM: array<f32, 140>;
+    var<workgroup> tD: array<f32, 140>;
 
-    @fragment
-    fn fsMain() -> @location(0) vec4f {
-      let dims = max(vec2i(textureDimensions(srcTex, 0)), vec2i(1));
-      var sumLuma: f32 = 0.0;
-      var sumHighlight: f32 = 0.0;
-      var maxPeak: f32 = 0.0;
-      var sumHdr: f32 = 0.0;
+    fn cs(a: ptr<function, f32>, b: ptr<function, f32>) {
+      let lo = min(*a, *b);
+      *b = max(*a, *b);
+      *a = lo;
+    }
 
-      for (var y: i32 = 0; y < 12; y = y + 1) {
-        let sy = clamp((y * dims.y) / 12 + dims.y / 24, 0, dims.y - 1);
-        for (var x: i32 = 0; x < 16; x = x + 1) {
-          let sx = clamp((x * dims.x) / 16 + dims.x / 32, 0, dims.x - 1);
-          let s = textureLoad(srcTex, vec2i(sx, sy), 0);
-          let luma = dot(s.rgb, vec3f(0.2126, 0.7152, 0.0722));
-          let maxC = max(s.r, max(s.g, s.b));
-          sumLuma = sumLuma + luma;
-          sumHighlight = sumHighlight + max(0.0, maxC - 0.72);
-          maxPeak = max(maxPeak, maxC);
-          sumHdr = sumHdr + select(0.0, 1.0, s.a > 1.03);
+    // 19-comparator median-of-9 network
+    fn median9(a0: f32, a1: f32, a2: f32, a3: f32, a4: f32, a5: f32, a6: f32, a7: f32, a8: f32) -> f32 {
+      var p0 = a0; var p1 = a1; var p2 = a2; var p3 = a3; var p4 = a4;
+      var p5 = a5; var p6 = a6; var p7 = a7; var p8 = a8;
+      cs(&p1, &p2); cs(&p4, &p5); cs(&p7, &p8);
+      cs(&p0, &p1); cs(&p3, &p4); cs(&p6, &p7);
+      cs(&p1, &p2); cs(&p4, &p5); cs(&p7, &p8);
+      cs(&p0, &p3); cs(&p5, &p8); cs(&p4, &p7);
+      cs(&p3, &p6); cs(&p1, &p4); cs(&p2, &p5);
+      cs(&p4, &p7); cs(&p4, &p2); cs(&p6, &p4);
+      cs(&p4, &p2);
+      return p4;
+    }
+
+    fn rw(m: f32, med: f32) -> f32 {
+      let d = (m - med) / 0.6;
+      return exp(-d * d);
+    }
+
+    @compute @workgroup_size(8, 8, 1)
+    fn csMap(
+      @builtin(workgroup_id) wid: vec3u,
+      @builtin(local_invocation_id) lid: vec3u,
+      @builtin(local_invocation_index) li: u32
+    ) {
+      let dims = vec2i(textureDimensions(cellTex));
+      let mxc = dims - vec2i(1);
+      let origin = vec2i(wid.xy) * 8 - vec2i(3, 1);
+      for (var k = li; k < 140u; k = k + 64u) {
+        let t = textureLoad(cellTex, clamp(origin + vec2i(i32(k % 14u), i32(k / 14u)), vec2i(0), mxc), 0);
+        tM[k] = t.y;
+        tD[k] = t.z;
+      }
+      workgroupBarrier();
+      let c = vec2i(wid.xy) * 8 + vec2i(lid.xy);
+      if (c.x >= dims.x || c.y >= dims.y) { return; }
+      let tc = i32(lid.y + 1u) * 14 + i32(lid.x + 3u);
+
+      let m0 = tM[tc - 15]; let m1 = tM[tc - 14]; let m2 = tM[tc - 13];
+      let m3 = tM[tc - 1];  let m4 = tM[tc];      let m5 = tM[tc + 1];
+      let m6 = tM[tc + 13]; let m7 = tM[tc + 14]; let m8 = tM[tc + 15];
+      // Median of the 3x3 cell levels rejects objects spanning up to ~2x2 cells; then a
+      // range-weighted mean around it keeps the map smooth.
+      let med = median9(m0, m1, m2, m3, m4, m5, m6, m7, m8);
+      let wc = rw(m0, med) * 0.5 + rw(m2, med) * 0.5 + rw(m6, med) * 0.5 + rw(m8, med) * 0.5;
+      let we = rw(m1, med) * 0.7 + rw(m3, med) * 0.7 + rw(m5, med) * 0.7 + rw(m7, med) * 0.7;
+      let w4 = rw(m4, med);
+      let bsum = (rw(m0, med) * m0 + rw(m2, med) * m2 + rw(m6, med) * m6 + rw(m8, med) * m8) * 0.5
+               + (rw(m1, med) * m1 + rw(m3, med) * m3 + rw(m5, med) * m5 + rw(m7, med) * m7) * 0.7
+               + w4 * m4;
+      let B = bsum / max(wc + we + w4, 1e-6);
+
+      // Caption / UI text: dense strong edges spread over a 56x24 px window (7x3 cells).
+      // An isolated speck or bird only lights one or two cells and stays far below threshold.
+      var dens = 0.0;
+      for (var dy = -1; dy <= 1; dy = dy + 1) {
+        for (var dx = -3; dx <= 3; dx = dx + 1) {
+          dens = dens + tD[tc + dy * 14 + dx];
         }
       }
+      let text = smoothstep(0.035, 0.09, dens / 21.0);
 
-      let invN: f32 = 1.0 / 192.0;
-      let avgLuma = sumLuma * invN;
-      let hlFrac = sumHighlight * invN;
-      let hdrFrac = sumHdr * invN;
-
-      let prev = textureLoad(prevStateTex, vec2i(0, 0), 0);
-      let reset = u.videoInfo.w > 0.5;
-
-      return vec4f(
-        select(mix(prev.r, avgLuma, 0.14), avgLuma, reset),
-        select(mix(prev.g, hlFrac, 0.14), hlFrac, reset),
-        select(mix(prev.b, maxPeak, 0.14), maxPeak, reset),
-        select(mix(prev.a, hdrFrac, 0.30), hdrFrac, reset)
-      );
+      let prev = textureLoad(prevMap, c, 0);
+      let reset = st.cut > 0.5;
+      let aT = select(u.stat.w, u.stat.z, text > prev.y);
+      let outB = select(mix(prev.x, B, u.stat.z), B, reset);
+      let outT = select(mix(prev.y, text, aT), text, reset);
+      textureStore(mapOut, c, vec4f(outB, outT, 0.0, 1.0));
     }
   `;
 
-  // Pass 1b: Source-Resolution Super-Resolution Feature Restoration
-  // (Variance-clipped temporal shimmer denoise + edge-preserving bilateral deblock
-  //  + 1px-stroke-protected structure-tensor contour steepening + clamped micro-texture deconv)
-  const RESTORE_FS = /* wgsl */ `
-    struct Uniforms {
-      rect: vec4f,
-      tone: vec4f,
-      extra: vec4f,
-      videoInfo: vec4f,
-      upscale: vec4f,
-    };
-
-    @group(0) @binding(0) var currSrcTex: texture_2d<f32>;
-    @group(0) @binding(1) var prevSrcTex: texture_2d<f32>;
-    @group(0) @binding(2) var<uniform> u: Uniforms;
-
-    fn ldSrc(tex: texture_2d<f32>, ip: vec2i, maxC: vec2i) -> vec4f {
-      return textureLoad(tex, clamp(ip, vec2i(0), maxC), 0);
-    }
-
-    fn luma(c: vec3f) -> f32 {
-      return dot(max(c, vec3f(0.0)), vec3f(0.2126, 0.7152, 0.0722));
-    }
-
+  // Upscale path: decode external texture once to nonlinear R'G'B' at source resolution.
+  const DECODE_FS = /* wgsl */ `
+    ${WGSL_VIDEO}
     @fragment
-    fn fsMain(@location(0) uv: vec2f) -> @location(0) vec4f {
-      let dims = max(vec2i(textureDimensions(currSrcTex, 0)), vec2i(1));
-      let maxC = dims - vec2i(1);
-      let ip = vec2i(clamp(uv * vec2f(dims), vec2f(0.0), vec2f(maxC)));
-
-      let sC = ldSrc(currSrcTex, ip, maxC);
-      let c  = max(sC.rgb, vec3f(0.0));
-      let n  = max(ldSrc(currSrcTex, ip + vec2i( 0, -1), maxC).rgb, vec3f(0.0));
-      let s  = max(ldSrc(currSrcTex, ip + vec2i( 0,  1), maxC).rgb, vec3f(0.0));
-      let e  = max(ldSrc(currSrcTex, ip + vec2i( 1,  0), maxC).rgb, vec3f(0.0));
-      let w  = max(ldSrc(currSrcTex, ip + vec2i(-1,  0), maxC).rgb, vec3f(0.0));
-      let nw = max(ldSrc(currSrcTex, ip + vec2i(-1, -1), maxC).rgb, vec3f(0.0));
-      let ne = max(ldSrc(currSrcTex, ip + vec2i( 1, -1), maxC).rgb, vec3f(0.0));
-      let sw = max(ldSrc(currSrcTex, ip + vec2i(-1,  1), maxC).rgb, vec3f(0.0));
-      let se = max(ldSrc(currSrcTex, ip + vec2i( 1,  1), maxC).rgb, vec3f(0.0));
-
-      let pC  = sqrt(c);
-      let pN  = sqrt(n);  let pS  = sqrt(s);  let pE  = sqrt(e);  let pW  = sqrt(w);
-      let pNW = sqrt(nw); let pNE = sqrt(ne); let pSW = sqrt(sw); let pSE = sqrt(se);
-
-      let lc = luma(pC);
-      let ln = luma(pN); let ls = luma(pS); let le = luma(pE); let lw = luma(pW);
-
-      // 1px stroke / thin typography ridge detector (protects tiny code/UI text from distortion)
-      let ridgeV = abs(lc - 0.5 * (ln + ls));
-      let ridgeH = abs(lc - 0.5 * (le + lw));
-      let isStroke = smoothstep(0.025, 0.075, max(ridgeV, ridgeH));
-
-      // Edge-preserving bilateral deblock (removes MPEG/VP9 gradient noise & blocks)
-      let invSigma2: f32 = 1.0 / (0.024 * 0.024);
-      var bSum = pC;
-      var bwSum: f32 = 1.0;
-      let nbrs = array<vec3f, 8>(pN, pS, pE, pW, pNW, pNE, pSW, pSE);
-      let swts = array<f32, 8>(0.75, 0.75, 0.75, 0.75, 0.45, 0.45, 0.45, 0.45);
-      for (var idx: i32 = 0; idx < 8; idx = idx + 1) {
-        let dl = luma(nbrs[idx]) - lc;
-        let wt = swts[idx] * exp(-(dl * dl) * invSigma2) * (1.0 - isStroke * 0.9);
-        bSum = bSum + nbrs[idx] * wt;
-        bwSum = bwSum + wt;
-      }
-      var pClean = bSum / bwSum;
-
-      // 3x3 neighborhood bounds (strictly prevents any halo/overshoot)
-      let pMinN = min(min(min(pN, pS), min(pE, pW)), min(min(pNW, pNE), min(pSW, pSE)));
-      let pMaxN = max(max(max(pN, pS), max(pE, pW)), max(max(pNW, pNE), max(pSW, pSE)));
-      let pMinBox = min(pC, pMinN);
-      let pMaxBox = max(pC, pMaxN);
-
-      // Variance-clipped temporal shimmer cleanup (zero ghosting: cuts to 0 on motion/cuts)
-      let pPrev = sqrt(max(ldSrc(prevSrcTex, ip, maxC).rgb, vec3f(0.0)));
-      let pPrevClamped = clamp(pPrev, pMinBox, pMaxBox);
-      let maxDiff = max(abs(pPrev.r - pC.r), max(abs(pPrev.g - pC.g), abs(pPrev.b - pC.b)));
-      let tReset = u.videoInfo.w > 0.5;
-      let tWeight = select(0.20 * smoothstep(0.028, 0.004, maxDiff) * (1.0 - isStroke * 0.5), 0.0, tReset);
-      pClean = mix(pClean, pPrevClamped, tWeight);
-      let lClean = luma(pClean);
-
-      // Structure Tensor directional coherence
-      let lnw = luma(pNW); let lne = luma(pNE); let lsw = luma(pSW); let lse = luma(pSE);
-      let gx = (lne + 2.0 * le + lse) - (lnw + 2.0 * lw + lsw);
-      let gy = (lsw + 2.0 * ls + lse) - (lnw + 2.0 * ln + lne);
-      let Jxx = gx * gx; let Jyy = gy * gy; let Jxy = gx * gy;
-      let trace = Jxx + Jyy;
-      let diff = Jxx - Jyy;
-      let disc = sqrt(max(diff * diff + 4.0 * Jxy * Jxy, 0.0));
-      let lam1 = 0.5 * (trace + disc);
-      let lam2 = 0.5 * (trace - disc);
-      let coherence = (lam1 - lam2) / max(lam1 + lam2 + 1e-4, 1e-4);
-
-      let sharp = clamp(u.upscale.z, 0.0, 1.0);
-
-      // Luma-only contour steepening (tightens soft 2-3px codec ramps without warping strokes)
-      let lMin3 = luma(pMinN);
-      let lMax3 = luma(pMaxN);
-      let localSpan = lMax3 - lMin3;
-      let lMid = 0.5 * (lMin3 + lMax3);
-      let isRamp = select(0.0, 1.0, lc > lMin3 + 0.008 && lc < lMax3 - 0.008);
-      let pushL = select(lMin3 - lClean, lMax3 - lClean, lClean > lMid);
-      let edgeGate = smoothstep(0.025, 0.12, localSpan) * (coherence * coherence) * isRamp * (1.0 - isStroke);
-      let steepAmt = mix(0.10, 0.36, sharp);
-      let lSteep = lClean + pushL * (steepAmt * edgeGate);
-
-      // Fine perceptual micro-texture deconvolution (strictly clamped in [lMin3, lMax3])
-      let blur1 = (pC * 4.0 + (pN + pS + pE + pW) * 2.0 + (pNW + pNE + pSW + pSE)) / 16.0;
-      let fineL = lClean - luma(blur1);
-      let texGate = smoothstep(0.014, 0.070, localSpan) * (1.0 - isStroke * 0.75);
-      let deconvAmt = mix(0.16, 0.62, sharp);
-      let lOut = clamp(lSteep + fineL * (deconvAmt * texGate), lMin3, lMax3);
-      let pRestored = clamp(pClean * (lOut / max(lClean, 1e-4)), pMinBox, pMaxBox);
-
-      return vec4f(pRestored * pRestored, sC.a);
+    fn fsDecode(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+      let p = vec2i(pos.xy);
+      return vec4f(max(loadVid(p).rgb, vec3f(0.0)), 1.0);
     }
   `;
 
-  // Pass 2: Unified Single-Pass Super-Resolution (EASU 12-tap + Halo-Free RCAS from featTex) + True-EDR Display-P3
-  const HDR_RENDER_FS = /* wgsl */ `
-    struct Uniforms {
-      rect: vec4f,       // (ox, oy, rw, rh) normalized content rect
-      tone: vec4f,       // (peakBoost, threshold, localPunch, gamutBoost)
-      extra: vec4f,      // (shadowDepth, aplGuard, splitPos, flags)
-      videoInfo: vec4f,  // (texelW, texelH, frameSeed, resetState)
-      upscale: vec4f,    // (srcW, srcH, sharpness, isUpscaled)
-    };
+  const FINAL_FS = /* wgsl */ `
+    ${WGSL_COMMON}
+    ${WGSL_VIDEO}
+    struct SceneU { v: vec4f };  // apl (smoothed), native-HDR fraction, effective peak, text cap
 
-    @group(0) @binding(0) var samp: sampler;
-    @group(0) @binding(1) var srcTex: texture_2d<f32>;
-    @group(0) @binding(2) var featTex: texture_2d<f32>;
-    @group(0) @binding(3) var stateTex: texture_2d<f32>;
-    @group(0) @binding(4) var<uniform> u: Uniforms;
+    @group(1) @binding(0) var samp: sampler;
+    @group(1) @binding(1) var srcTex: texture_2d<f32>;  // decoded source (upscale path)
+    @group(1) @binding(2) var resTex: texture_2d<f32>;  // SR result (ML path)
+    @group(1) @binding(3) var mapTex: texture_2d<f32>;  // (log2 background, text region)
+    @group(1) @binding(4) var<uniform> u: FrameU;
+    @group(1) @binding(5) var<uniform> scene: SceneU;
+    @group(1) @binding(6) var lutTex: texture_2d<f32>;  // per-frame tone LUT over log2(E)
 
     fn linearToSrgbExt(c: vec3f) -> vec3f {
       let lo = c * 12.92;
@@ -303,10 +419,6 @@
       );
     }
 
-    fn luma709(c: vec3f) -> f32 {
-      return dot(max(c, vec3f(0.0)), vec3f(0.2126, 0.7152, 0.0722));
-    }
-
     fn lumaP3(c: vec3f) -> f32 {
       return dot(max(c, vec3f(0.0)), vec3f(0.2289746, 0.6917385, 0.0792869));
     }
@@ -316,10 +428,203 @@
       return fract(magic.z * fract(dot(p, magic.xy)));
     }
 
-    fn loadFeat(coord: vec2i, maxC: vec2i) -> vec3f {
-      return textureLoad(featTex, clamp(coord, vec2i(0), maxC), 0).rgb;
+    // Untouched SDR (or native HDR) passthrough, colour-managed into the Display-P3 canvas
+    fn sdrOut(raw: vec3f) -> vec4f {
+      return vec4f(linearToSrgbExt(srgbToP3(decodeLinear(raw))), 1.0);
     }
 
+    // Edge-aware slice of the 1/8-res map: 2x2 joint-bilateral weights pick the cells whose
+    // background level matches this pixel, so large edges never bleed across (halo-free).
+    fn sliceMap(vuv: vec2f, L: f32) -> vec2f {
+      let muv = vuv * u.outp.zw;
+      let g = textureGather(0, mapTex, samp, muv);
+      let f = fract(muv * vec2f(textureDimensions(mapTex)) - vec2f(0.5));
+      let bw = vec4f((1.0 - f.x) * f.y, f.x * f.y, f.x * (1.0 - f.y), (1.0 - f.x) * (1.0 - f.y));
+      // Range weight: cells within ~1.8 stops of the pixel; pixels far from all four (highlights)
+      // fall back to plain bilinear through the epsilon.
+      let d = vec4f(L) - g;
+      let x = max(vec4f(1.0) - 0.3 * d * d, vec4f(0.0));
+      let w = bw * (x * x + vec4f(1e-4));
+      let B = dot(w, g) / max(dot(w, vec4f(1.0)), 1e-6);
+      let t = textureSampleLevel(mapTex, samp, muv, 0.0).y;
+      return vec2f(B, t);
+    }
+
+    fn toneMapHDR(c0: vec3f, vuv: vec2f, fragPos: vec4f) -> vec4f {
+      let p3Linear = srgbToP3(c0);
+      let maxIn = max(c0.r, max(c0.g, c0.b));
+      let E = mix(luma709(c0), maxIn, 0.46);
+      let L = log2(max(E, 1.0 / 16384.0));
+      // (global EDR gain over the knee, highlight weight, saturation term) for this brightness
+      let lut = textureSampleLevel(lutTex, samp, vec2f((L - (${LUT_L0.toFixed(1)})) * ${(1 / (LUT_L1 - LUT_L0)).toFixed(8)}, 0.5), 0.0);
+
+      // Pixel vs. local background (same map at source scale for every output path)
+      let loc = sliceMap(vuv, L);
+      let bg = exp2(loc.x);
+      let detail = max(0.0, E - bg * 1.15);
+      // Text protection only for pixels well above their background inside text-dense regions
+      let textProt = clamp(loc.y, 0.0, 1.0) * smoothstep(0.08, 0.30, detail);
+
+      // Deep-black-only shadow floor (< 0.015 linear)
+      var shadowRatio = 1.0;
+      if (maxIn < 0.015) {
+        let blackToe = pow(max(maxIn, 1e-5), u.extra.x * 0.35);
+        let blackMix = 1.0 - smoothstep(0.002, 0.015, maxIn);
+        shadowRatio = mix(1.0, clamp(blackToe, 0.78, 1.0), blackMix);
+      }
+
+      // EDR highlight curve above the knee (white-screen guarded peak) from the LUT
+      var hdrGain = lut.x;
+
+      // Local specular punch: brightness above the robust local background
+      let localMask = smoothstep(0.02, 0.24, detail) * lut.y * (1.0 - textProt * 0.85);
+      hdrGain = hdrGain * (1.0 + u.tone.z * 0.90 * localMask);
+
+      hdrGain = mix(hdrGain, min(hdrGain, scene.v.w), textProt * 0.85);
+
+      var hdrP3 = p3Linear * (hdrGain * shadowRatio);
+      let p3Y = lumaP3(hdrP3);
+      let satScale = 1.0 + lut.z * (1.0 - textProt * 0.6);
+      hdrP3 = max(vec3f(0.0), mix(vec3f(p3Y), hdrP3, satScale));
+
+      var outP3 = linearToSrgbExt(hdrP3);
+      let d1 = ign(fragPos.xy + vec2f(u.info.z * 17.0, 0.0));
+      let d2 = ign(fragPos.xy + vec2f(0.0, u.info.z * 31.0));
+      let dither = (d1 + d2 - 1.0) * (0.5 / 1023.0);
+      outP3 = max(vec3f(0.0), outP3 + vec3f(dither));
+      return vec4f(outP3, 1.0);
+    }
+
+    fn shade(raw: vec3f, vuv: vec2f, fragPos: vec4f) -> vec4f {
+      let flags = u32(u.extra.w + 0.5);
+      let maxRaw = max(raw.r, max(raw.g, raw.b));
+      if ((flags & 1u) == 0u || ((flags & 2u) != 0u && (scene.v.y > 0.02 || maxRaw > 1.03))) {
+        return sdrOut(raw);
+      }
+      return toneMapHDR(decodeLinear(raw), vuv, fragPos);
+    }
+
+    fn contentUV(uv: vec2f) -> vec2f {
+      return (uv - u.rect.xy) / u.rect.zw;
+    }
+
+    fn outside(vuv: vec2f) -> bool {
+      return any(vuv < vec2f(0.0)) || any(vuv > vec2f(1.0));
+    }
+
+    fn onDivider(uv: vec2f) -> bool {
+      return u.extra.z >= 0.0 && abs(uv.x - u.extra.z) < 0.0016;
+    }
+
+    fn leftOfSplit(uv: vec2f) -> bool {
+      return u.extra.z >= 0.0 && uv.x < u.extra.z;
+    }
+
+    // ---- HDR-only path: canvas content at min(source, display) resolution -------------------
+    @fragment
+    fn fsDirect(@builtin(position) fragPos: vec4f, @location(0) uv: vec2f) -> @location(0) vec4f {
+      let vuv = contentUV(uv);
+      if (outside(vuv)) { return vec4f(0.0, 0.0, 0.0, 1.0); }
+      if (onDivider(uv)) { return vec4f(1.8, 1.8, 1.8, 1.0); }
+      let ratio = u.info.xy / max(u.outp.xy, vec2f(1.0));
+      var raw: vec3f;
+      if (max(ratio.x, ratio.y) > 1.4) {
+        // Display smaller than the source: 4 bilinear taps = box-filtered minification
+        let o = 0.25 * ratio / u.info.xy;
+        raw = 0.25 * (textureSampleBaseClampToEdge(vidTex, samp, vuv + vec2f(-o.x, -o.y)).rgb
+                    + textureSampleBaseClampToEdge(vidTex, samp, vuv + vec2f( o.x, -o.y)).rgb
+                    + textureSampleBaseClampToEdge(vidTex, samp, vuv + vec2f(-o.x,  o.y)).rgb
+                    + textureSampleBaseClampToEdge(vidTex, samp, vuv + vec2f( o.x,  o.y)).rgb);
+      } else {
+        raw = textureSampleBaseClampToEdge(vidTex, samp, vuv).rgb;
+      }
+      if (leftOfSplit(uv)) { return sdrOut(raw); }
+      return shade(raw, vuv, fragPos);
+    }
+
+    // ---- ML path: resample the 2x/4x SR result to the exact device-pixel content rect --------
+    fn crW(f: f32) -> vec4f {
+      return vec4f(
+        f * (-0.5 + f * (1.0 - 0.5 * f)),
+        1.0 + f * f * (-2.5 + 1.5 * f),
+        f * (0.5 + f * (2.0 - 1.5 * f)),
+        f * f * (-0.5 + 0.5 * f)
+      );
+    }
+
+    fn bsW(f: f32) -> vec4f {
+      let g = 1.0 - f;
+      return vec4f(g * g * g, 4.0 - 6.0 * f * f + 3.0 * f * f * f, 1.0 + 3.0 * f + 3.0 * f * f - 3.0 * f * f * f, f * f * f) / 6.0;
+    }
+
+    fn resampleSR(vuv: vec2f) -> vec3f {
+      let R = u.res.xy;
+      let s = R / max(u.outp.xy, vec2f(1.0));
+      let sharp = clamp(u.res.z, 0.0, 1.0);
+      if (max(s.x, s.y) <= 1.0) {
+        // Magnify: 4x4 Catmull-Rom, unsharp vs. cubic B-spline from the same taps,
+        // clamped to the nearest 2x2 texels (no ringing / halos)
+        let p = vuv * R - vec2f(0.5);
+        let fp = floor(p);
+        let f = p - fp;
+        let ip = vec2i(fp);
+        let mxc = vec2i(R) - vec2i(1);
+        let wcx = crW(f.x);
+        let wcy = crW(f.y);
+        let wbx = bsW(f.x);
+        let wby = bsW(f.y);
+        var cr = vec3f(0.0);
+        var bs = vec3f(0.0);
+        var mn = vec3f(1e9);
+        var mxv = vec3f(-1e9);
+        for (var j = 0; j < 4; j = j + 1) {
+          for (var i = 0; i < 4; i = i + 1) {
+            let t = textureLoad(resTex, clamp(ip + vec2i(i - 1, j - 1), vec2i(0), mxc), 0).rgb;
+            cr = cr + t * (wcx[i] * wcy[j]);
+            bs = bs + t * (wbx[i] * wby[j]);
+            if (i >= 1 && i <= 2 && j >= 1 && j <= 2) {
+              mn = min(mn, t);
+              mxv = max(mxv, t);
+            }
+          }
+        }
+        return clamp(cr + (cr - bs) * (1.2 * sharp), mn, mxv);
+      }
+      // Minify (s in (1, 2]): 4x4 bilinear taps spaced s/2 texels (each tap is a 2x2 prefilter),
+      // Lanczos-2 weights at +-s/4, +-3s/4; unsharp vs. the flat average of the same taps.
+      let h = 0.5 * max(s, vec2f(1.0));
+      let c = vuv * R;
+      let lw = vec4f(0.105, 0.395, 0.395, 0.105);
+      var acc = vec3f(0.0);
+      var flat = vec3f(0.0);
+      var mn = vec3f(1e9);
+      var mxv = vec3f(-1e9);
+      for (var j = 0; j < 4; j = j + 1) {
+        for (var i = 0; i < 4; i = i + 1) {
+          let pos = c + (vec2f(f32(i), f32(j)) - vec2f(1.5)) * h;
+          let t = textureSampleLevel(resTex, samp, pos / R, 0.0).rgb;
+          acc = acc + t * (lw[i] * lw[j]);
+          flat = flat + t;
+          if (i >= 1 && i <= 2 && j >= 1 && j <= 2) {
+            mn = min(mn, t);
+            mxv = max(mxv, t);
+          }
+        }
+      }
+      flat = flat * (1.0 / 16.0);
+      return clamp(acc + (acc - flat) * (0.30 + 0.90 * sharp), mn, mxv);
+    }
+
+    @fragment
+    fn fsSR(@builtin(position) fragPos: vec4f, @location(0) uv: vec2f) -> @location(0) vec4f {
+      let vuv = contentUV(uv);
+      if (outside(vuv)) { return vec4f(0.0, 0.0, 0.0, 1.0); }
+      if (onDivider(uv)) { return vec4f(1.8, 1.8, 1.8, 1.0); }
+      if (leftOfSplit(uv)) { return sdrOut(textureSampleLevel(srcTex, samp, vuv, 0.0).rgb); }
+      return shade(max(resampleSR(vuv), vec3f(0.0)), vuv, fragPos);
+    }
+
+    // ---- Spatial fallback: 12-tap EASU + RCAS-style clamp sharpening from the decoded source --
     fn easuTap(
       cSum: ptr<function, vec3f>,
       wSum: ptr<function, f32>,
@@ -338,156 +643,30 @@
       *wSum = *wSum + w;
     }
 
-    fn applyTrueHDR(
-      c0: vec3f,
-      n1: vec3f,
-      s1: vec3f,
-      e1: vec3f,
-      w1: vec3f,
-      localY: f32,
-      avgLuma: f32,
-      fragPos: vec4f
-    ) -> vec4f {
-      let p3Linear = srgbToP3(c0);
-      let Y = luma709(c0);
-      let maxIn = max(c0.r, max(c0.g, c0.b));
-      let E = mix(Y, maxIn, 0.46);
-      let Ep = pow(max(E, 0.0), 1.0 / 2.2);
-
-      let eN1 = mix(luma709(n1), max(n1.r, max(n1.g, n1.b)), 0.46);
-      let eS1 = mix(luma709(s1), max(s1.r, max(s1.g, s1.b)), 0.46);
-      let eE1 = mix(luma709(e1), max(e1.r, max(e1.g, e1.b)), 0.46);
-      let eW1 = mix(luma709(w1), max(w1.r, max(w1.g, w1.b)), 0.46);
-      let minE1 = min(min(eN1, eS1), min(eE1, eW1));
-      let strokeJump = max(0.0, E - localY);
-
-      // Protect thin 1px UI/code text strokes without capping genuine pure-white sparks/highlights
-      let isThinStroke = smoothstep(0.18, 0.48, strokeJump)
-                       * (1.0 - smoothstep(0.06, 0.20, localY))
-                       * (1.0 - smoothstep(0.15, 0.40, minE1 / max(E, 0.04)))
-                       * (1.0 - smoothstep(0.74, 0.96, maxIn));
-
-      // Gentle White-Screen APL guard (only activates on very bright full-white slides/snow, >= 0.45 linear)
-      let aplAtten = 1.0 - u.extra.y * smoothstep(0.45, 0.88, avgLuma);
-      let effPeak = 1.0 + (u.tone.x - 1.0) * clamp(aplAtten, 0.45, 1.0);
-
-      // Deep-black-only shadow floor (strictly < 0.015 linear so UI & text are untouched)
-      let shadowStrength = u.extra.x;
-      let blackToe = pow(max(maxIn, 1e-5), 1.0 + shadowStrength * 0.35) / max(maxIn, 1e-5);
-      let blackMix = smoothstep(0.015, 0.002, maxIn);
-      let shadowRatio = mix(1.0, clamp(blackToe, 0.78, 1.0), blackMix);
-
-      // Responsive EDR highlight curve above perceptual knee
-      let knee = clamp(u.tone.y, 0.15, 0.88);
-      var hdrGain: f32 = 1.0;
-      if (Ep > knee) {
-        let t = clamp((Ep - knee) / max(1.0 - knee, 0.05), 0.0, 1.0);
-        let smoothRamp = t * t * (3.0 - 2.0 * t);
-        let fastRamp = pow(t, 0.85);
-        let curve = mix(smoothRamp, fastRamp, 0.55);
-        hdrGain = 1.0 + (effPeak - 1.0) * curve;
-      }
-
-      // Local specular punch on isolated bright highlights
-      let localDetail = max(0.0, E - localY);
-      let localMask = smoothstep(0.02, 0.24, localDetail) * smoothstep(0.10, 0.62, E) * (1.0 - isThinStroke * 0.85);
-      hdrGain = hdrGain * (1.0 + u.tone.z * 0.90 * localMask);
-
-      // Gently bound 1px UI/code text bloom while leaving bright sparks/speculars uncapped
-      let textCap = max(1.65, effPeak * 0.32);
-      hdrGain = mix(hdrGain, min(hdrGain, textCap), isThinStroke * 0.85);
-
-      var hdrP3 = p3Linear * (hdrGain * shadowRatio);
-
-      let p3Y = lumaP3(hdrP3);
-      let satScale = 1.0 + u.tone.w * 0.35 * smoothstep(0.06, 0.70, E) * (1.0 - isThinStroke * 0.6);
-      hdrP3 = max(vec3f(0.0), mix(vec3f(p3Y), hdrP3, satScale));
-
-      var outP3 = linearToSrgbExt(hdrP3);
-      let d1 = ign(fragPos.xy + vec2f(u.videoInfo.z * 17.0, 0.0));
-      let d2 = ign(fragPos.xy + vec2f(0.0, u.videoInfo.z * 31.0));
-      let dither = (d1 + d2 - 1.0) * (0.5 / 1023.0);
-      outP3 = max(vec3f(0.0), outP3 + vec3f(dither));
-
-      return vec4f(outP3, 1.0);
+    fn ld(coord: vec2i, mxc: vec2i) -> vec3f {
+      return textureLoad(srcTex, clamp(coord, vec2i(0), mxc), 0).rgb;
     }
 
-    @fragment
-    fn fsMain(@builtin(position) fragPos: vec4f, @location(0) uv: vec2f) -> @location(0) vec4f {
-      let vuv = (uv - u.rect.xy) / u.rect.zw;
-      if (vuv.x < 0.0 || vuv.x > 1.0 || vuv.y < 0.0 || vuv.y > 1.0) {
-        return vec4f(0.0, 0.0, 0.0, 1.0);
-      }
-
-      // Split Compare: Left = original native bilinear SDR, Right = active Upscaling and/or HDR
-      let splitPos = u.extra.z;
-      if (splitPos >= 0.0) {
-        if (abs(uv.x - splitPos) < 0.0016) {
-          return vec4f(1.8, 1.8, 1.8, 1.0);
-        }
-        if (uv.x < splitPos) {
-          let orig = textureSampleLevel(srcTex, samp, vuv, 0.0).rgb;
-          return vec4f(linearToSrgbExt(orig), 1.0);
-        }
-      }
-
-      let flags = u32(u.extra.w + 0.5);
-      let isHdrEnabled = (flags & 1u) != 0u;
-      let bypassNativeHdr = (flags & 2u) != 0u;
-      let isUpscaled = u.upscale.w > 0.5;
-
-      let scene = textureLoad(stateTex, vec2i(0, 0), 0);
-      let avgLuma = scene.r;
-      let nativeHdrFrac = scene.a;
-
-      let dims = textureDimensions(srcTex, 0);
-      let maxC = vec2i(dims) - vec2i(1);
-      let srcSize = vec2f(dims);
-      let px = u.videoInfo.xy;
-
-      if (!isUpscaled) {
-        let s0 = textureSampleLevel(srcTex, samp, vuv, 0.0);
-        let c0 = s0.rgb;
-        if (!isHdrEnabled || (bypassNativeHdr && (nativeHdrFrac > 0.02 || s0.a > 1.03))) {
-          return vec4f(linearToSrgbExt(c0), 1.0);
-        }
-
-        let n1 = textureSampleLevel(srcTex, samp, clamp(vuv + vec2f(0.0, -px.y), vec2f(0.0), vec2f(1.0)), 0.0).rgb;
-        let s1 = textureSampleLevel(srcTex, samp, clamp(vuv + vec2f(0.0,  px.y), vec2f(0.0), vec2f(1.0)), 0.0).rgb;
-        let e1 = textureSampleLevel(srcTex, samp, clamp(vuv + vec2f( px.x, 0.0), vec2f(0.0), vec2f(1.0)), 0.0).rgb;
-        let w1 = textureSampleLevel(srcTex, samp, clamp(vuv + vec2f(-px.x, 0.0), vec2f(0.0), vec2f(1.0)), 0.0).rgb;
-
-        let stepUV = px * 3.5;
-        let cN = textureSampleLevel(srcTex, samp, clamp(vuv + vec2f(0.0, -stepUV.y), vec2f(0.0), vec2f(1.0)), 0.0).rgb;
-        let cS = textureSampleLevel(srcTex, samp, clamp(vuv + vec2f(0.0,  stepUV.y), vec2f(0.0), vec2f(1.0)), 0.0).rgb;
-        let cE = textureSampleLevel(srcTex, samp, clamp(vuv + vec2f( stepUV.x, 0.0), vec2f(0.0), vec2f(1.0)), 0.0).rgb;
-        let cW = textureSampleLevel(srcTex, samp, clamp(vuv + vec2f(-stepUV.x, 0.0), vec2f(0.0), vec2f(1.0)), 0.0).rgb;
-        let localY = 0.25 * (luma709(cN) + luma709(cS) + luma709(cE) + luma709(cW));
-
-        return applyTrueHDR(c0, n1, s1, e1, w1, localY, avgLuma, fragPos);
-      }
-
-      // 12-tap EASU reconstruction + halo-free perceptual RCAS from restored featTex
-      let fdims = textureDimensions(featTex, 0);
-      let fmaxC = vec2i(fdims) - vec2i(1);
-      let fsrcSize = vec2f(fdims);
-      let p = vuv * fsrcSize - vec2f(0.5);
+    fn easuSpatial(vuv: vec2f) -> vec3f {
+      let fdims = vec2f(textureDimensions(srcTex));
+      let mxc = vec2i(fdims) - vec2i(1);
+      let p = vuv * fdims - vec2f(0.5);
       let fp = floor(p);
       let f = p - fp;
       let ip = vec2i(fp);
 
-      let b  = loadFeat(ip + vec2i( 0, -1), fmaxC);
-      let c  = loadFeat(ip + vec2i( 1, -1), fmaxC);
-      let e  = loadFeat(ip + vec2i(-1,  0), fmaxC);
-      let f0 = loadFeat(ip + vec2i( 0,  0), fmaxC);
-      let f1 = loadFeat(ip + vec2i( 1,  0), fmaxC);
-      let h  = loadFeat(ip + vec2i( 2,  0), fmaxC);
-      let i  = loadFeat(ip + vec2i(-1,  1), fmaxC);
-      let j  = loadFeat(ip + vec2i( 0,  1), fmaxC);
-      let k  = loadFeat(ip + vec2i( 1,  1), fmaxC);
-      let l  = loadFeat(ip + vec2i( 2,  1), fmaxC);
-      let n  = loadFeat(ip + vec2i( 0,  2), fmaxC);
-      let o  = loadFeat(ip + vec2i( 1,  2), fmaxC);
+      let b  = ld(ip + vec2i( 0, -1), mxc);
+      let c  = ld(ip + vec2i( 1, -1), mxc);
+      let e  = ld(ip + vec2i(-1,  0), mxc);
+      let f0 = ld(ip + vec2i( 0,  0), mxc);
+      let f1 = ld(ip + vec2i( 1,  0), mxc);
+      let h  = ld(ip + vec2i( 2,  0), mxc);
+      let i  = ld(ip + vec2i(-1,  1), mxc);
+      let j  = ld(ip + vec2i( 0,  1), mxc);
+      let k  = ld(ip + vec2i( 1,  1), mxc);
+      let l  = ld(ip + vec2i( 2,  1), mxc);
+      let n  = ld(ip + vec2i( 0,  2), mxc);
+      let o  = ld(ip + vec2i( 1,  2), mxc);
 
       let lb = luma709(b); let lc = luma709(c);
       let le = luma709(e); let lf0 = luma709(f0); let lf1 = luma709(f1); let lh = luma709(h);
@@ -534,33 +713,536 @@
       let max4 = max(max(f0, f1), max(j, k));
       let recon = clamp(cSum / max(wSum, 1e-4), min4, max4);
 
-      // Phase-locked halo-free perceptual RCAS detail boost (strictly clamped to [pMin4, pMax4])
-      let n1 = mix(b, c, f.x);
-      let s1 = mix(n, o, f.x);
-      let e1 = mix(h, l, f.y);
-      let w1n = mix(e, i, f.y);
-
+      // RCAS-style detail boost on the gamma-encoded signal, clamped to [min4, max4]
       let bilin = f0 * w0 + f1 * w1 + j * w2 + k * w3;
-      let pRecon = sqrt(max(recon, vec3f(0.0)));
-      let pBilin = sqrt(max(bilin, vec3f(0.0)));
-      let pMin4 = sqrt(max(min4, vec3f(0.0)));
-      let pMax4 = sqrt(max(max4, vec3f(0.0)));
-      let contrast = max(max(pMax4.r - pMin4.r, pMax4.g - pMin4.g), pMax4.b - pMin4.b);
+      let contrast = max(max(max4.r - min4.r, max4.g - min4.g), max4.b - min4.b);
       let noiseGate = smoothstep(0.015, 0.080, contrast);
-      let lobe = clamp(min(luma709(pMin4), 1.0 - luma709(pMax4)) / max(luma709(pMax4), 1e-4), 0.0, 1.0);
-      let sharpAmt = clamp(u.upscale.z, 0.0, 1.0) * 1.05 * noiseGate * (0.35 + 0.65 * lobe);
-      let pSharp = clamp(pRecon + (pRecon - pBilin) * sharpAmt, pMin4, pMax4);
-      let c0 = pSharp * pSharp;
+      let lobe = clamp(min(luma709(min4), 1.0 - luma709(max4)) / max(luma709(max4), 1e-4), 0.0, 1.0);
+      let sharpAmt = clamp(u.res.z, 0.0, 1.0) * 1.05 * noiseGate * (0.35 + 0.65 * lobe);
+      return clamp(recon + (recon - bilin) * sharpAmt, min4, max4);
+    }
 
-      let centerRaw = textureSampleLevel(srcTex, samp, vuv, 0.0);
-      if (!isHdrEnabled || (bypassNativeHdr && (nativeHdrFrac > 0.02 || centerRaw.a > 1.03))) {
-        return vec4f(linearToSrgbExt(c0), 1.0);
-      }
-
-      let localY = 0.25 * (luma709(n1) + luma709(s1) + luma709(e1) + luma709(w1n));
-      return applyTrueHDR(c0, n1, s1, e1, w1n, localY, avgLuma, fragPos);
+    @fragment
+    fn fsSpatial(@builtin(position) fragPos: vec4f, @location(0) uv: vec2f) -> @location(0) vec4f {
+      let vuv = contentUV(uv);
+      if (outside(vuv)) { return vec4f(0.0, 0.0, 0.0, 1.0); }
+      if (onDivider(uv)) { return vec4f(1.8, 1.8, 1.8, 1.0); }
+      if (leftOfSplit(uv)) { return sdrOut(textureSampleLevel(srcTex, samp, vuv, 0.0).rgb); }
+      return shade(max(easuSpatial(vuv), vec3f(0.0)), vuv, fragPos);
     }
   `;
+
+  const SHADER_SOURCES = {
+    vs: FULLSCREEN_VS,
+    analyze: ANALYZE_CS,
+    analyzeLoad: ANALYZE_LOAD_CS,
+    stats: STATS_CS,
+    map: MAP_CS,
+    decode: DECODE_FS,
+    final: FINAL_FS
+  };
+
+  // For offscreen tests: texture_2d<f32> instead of texture_external (otherwise identical source)
+  function substituteTexture2D(code) {
+    return code
+      .split('texture_external').join('texture_2d<f32>')
+      .split('textureLoad(vidTex, p)').join('textureLoad(vidTex, p, 0)');
+  }
+
+  async function createCore(device, opts = {}) {
+    const test2D = Boolean(opts.texture2DSource);
+    const prep = (code) => (test2D ? substituteTexture2D(code) : code);
+    const SS = GPUShaderStage;
+    const C = SS.COMPUTE;
+    const F = SS.FRAGMENT;
+    const tex = (visibility, binding) => ({ binding, visibility, texture: { sampleType: 'float' } });
+    const ubuf = (visibility, binding) => ({ binding, visibility, buffer: { type: 'uniform' } });
+
+    const videoBGL = device.createBindGroupLayout({
+      label: 'truehdr-video',
+      entries: [test2D
+        ? { binding: 0, visibility: C | F, texture: { sampleType: 'float' } }
+        : { binding: 0, visibility: C | F, externalTexture: {} }]
+    });
+    const anaBGL = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: C, storageTexture: { access: 'write-only', format: 'rgba16float' } },
+        { binding: 1, visibility: C, sampler: { type: 'filtering' } },
+        { binding: 2, visibility: C, buffer: { type: 'storage' } }
+      ]
+    });
+    const statsBGL = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: C, buffer: { type: 'read-only-storage' } },
+        { binding: 1, visibility: C, buffer: { type: 'storage' } },
+        ubuf(C, 2),
+        { binding: 3, visibility: C, storageTexture: { access: 'write-only', format: 'rgba16float' } }
+      ]
+    });
+    const mapBGL = device.createBindGroupLayout({
+      entries: [
+        tex(C, 0),
+        tex(C, 1),
+        { binding: 2, visibility: C, storageTexture: { access: 'write-only', format: 'rgba16float' } },
+        { binding: 3, visibility: C, buffer: { type: 'read-only-storage' } },
+        ubuf(C, 4)
+      ]
+    });
+    const finalBGL = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: F, sampler: { type: 'filtering' } },
+        tex(F, 1),
+        tex(F, 2),
+        tex(F, 3),
+        ubuf(F, 4),
+        ubuf(F, 5),
+        tex(F, 6)
+      ]
+    });
+
+    const sources = {};
+    const modules = {};
+    for (const [name, code] of Object.entries(SHADER_SOURCES)) {
+      sources[name] = prep(code);
+      modules[name] = device.createShaderModule({ label: `truehdr-${name}`, code: sources[name] });
+    }
+
+    const PL = (bgls) => device.createPipelineLayout({ bindGroupLayouts: bgls });
+    const compute = (name, entryPoint, layout) =>
+      device.createComputePipelineAsync({ label: `truehdr-${name}`, layout, compute: { module: modules[name], entryPoint } });
+    const render = (name, entryPoint, layout) =>
+      device.createRenderPipelineAsync({
+        label: `truehdr-${name}-${entryPoint}`,
+        layout,
+        vertex: { module: modules.vs, entryPoint: 'vsMain' },
+        fragment: { module: modules[name], entryPoint, targets: [{ format: 'rgba16float' }] },
+        primitive: { topology: 'triangle-list' }
+      });
+
+    const finalLayout = PL([videoBGL, finalBGL]);
+    const anaLayout = PL([videoBGL, anaBGL]);
+    // Prefer bilinear quad taps; fall back to textureLoad if the implementation rejects sampling
+    // an external texture in a compute shader.
+    const analyzePipe = compute('analyze', 'csAnalyze', anaLayout).then(
+      (pipe) => ({ pipe, variant: 'sampled' }),
+      () => compute('analyzeLoad', 'csAnalyze', anaLayout).then((pipe) => ({ pipe, variant: 'load' }))
+    );
+    const [ana, stats, map, decode, finalDirect, finalSR, finalSpatial] = await Promise.all([
+      analyzePipe,
+      compute('stats', 'csStats', PL([statsBGL])),
+      compute('map', 'csMap', PL([mapBGL])),
+      render('decode', 'fsDecode', PL([videoBGL])),
+      render('final', 'fsDirect', finalLayout),
+      render('final', 'fsSR', finalLayout),
+      render('final', 'fsSpatial', finalLayout)
+    ]);
+
+    const sampler = device.createSampler({
+      magFilter: 'linear',
+      minFilter: 'linear',
+      addressModeU: 'clamp-to-edge',
+      addressModeV: 'clamp-to-edge'
+    });
+    const dummyTex = device.createTexture({
+      size: [1, 1, 1],
+      format: 'rgba16float',
+      usage: GPUTextureUsage.TEXTURE_BINDING
+    });
+
+    return {
+      device,
+      test2D,
+      sources,
+      modules,
+      sampler,
+      dummyView: dummyTex.createView(),
+      analyzeVariant: ana.variant,
+      layouts: { videoBGL, anaBGL, statsBGL, mapBGL, finalBGL },
+      pipes: { analyze: ana.pipe, stats, map, decode, finalDirect, finalSR, finalSpatial }
+    };
+  }
+
+  // Per-video GPU resources and per-frame encoding. Allocations happen only on size changes;
+  // per frame: one bind group for the external texture (+ the swapchain view owned by the caller).
+  class FrameRenderer {
+    constructor(core) {
+      this.core = core;
+      const d = core.device;
+      this.frameU = d.createBuffer({ size: FRAME_U_FLOATS * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      this.sceneU = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      this.state = d.createBuffer({
+        size: STATE_BYTES,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+      });
+      this.u = new Float32Array(FRAME_U_FLOATS);
+      this.lutTex = d.createTexture({
+        size: [256, 1, 1],
+        format: 'rgba16float',
+        usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING
+      });
+      this.lutView = this.lutTex.createView();
+      this.srcW = 0;
+      this.srcH = 0;
+      this.cellsW = 0;
+      this.cellsH = 0;
+      this.cellTex = null;
+      this.partials = null;
+      this.mapTex = [null, null];
+      this.mapViews = [null, null];
+      this.mapIdx = 0;
+      this.anaBG = null;
+      this.statsBG = null;
+      this.mapBGs = [null, null];
+      this.decTex = null;
+      this.decView = null;
+      this.finalBGs = new Map();
+      this.needReset = true;
+      this.ts = null;
+    }
+
+    releaseSized() {
+      for (const t of [this.cellTex, this.mapTex[0], this.mapTex[1], this.decTex, this.partials]) {
+        if (t) {
+          try { t.destroy(); } catch (_) {}
+        }
+      }
+      this.cellTex = null;
+      this.partials = null;
+      this.mapTex = [null, null];
+      this.mapViews = [null, null];
+      this.decTex = null;
+      this.decView = null;
+      this.anaBG = null;
+      this.statsBG = null;
+      this.mapBGs = [null, null];
+      this.finalBGs.clear();
+      this.srcW = 0;
+      this.srcH = 0;
+    }
+
+    ensure(w, h) {
+      if (this.cellTex && this.srcW === w && this.srcH === h) return true;
+      this.releaseSized();
+      const core = this.core;
+      const d = core.device;
+      const cw = Math.ceil(w / CELL);
+      const ch = Math.ceil(h / CELL);
+      const usage = GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING;
+      this.cellTex = d.createTexture({ size: [cw, ch, 1], format: 'rgba16float', usage });
+      const cellView = this.cellTex.createView();
+      for (let i = 0; i < 2; i++) {
+        this.mapTex[i] = d.createTexture({ size: [cw, ch, 1], format: 'rgba16float', usage });
+        this.mapViews[i] = this.mapTex[i].createView();
+      }
+      this.groupsW = Math.ceil(cw / 8);
+      this.groupsH = Math.ceil(ch / 8);
+      this.partials = d.createBuffer({ size: this.groupsW * this.groupsH * PARTIAL_BYTES, usage: GPUBufferUsage.STORAGE });
+      this.anaBG = d.createBindGroup({
+        layout: core.layouts.anaBGL,
+        entries: [
+          { binding: 0, resource: cellView },
+          { binding: 1, resource: core.sampler },
+          { binding: 2, resource: { buffer: this.partials } }
+        ]
+      });
+      this.statsBG = d.createBindGroup({
+        layout: core.layouts.statsBGL,
+        entries: [
+          { binding: 0, resource: { buffer: this.partials } },
+          { binding: 1, resource: { buffer: this.state } },
+          { binding: 2, resource: { buffer: this.frameU } },
+          { binding: 3, resource: this.lutView }
+        ]
+      });
+      for (let i = 0; i < 2; i++) {
+        this.mapBGs[i] = d.createBindGroup({
+          layout: core.layouts.mapBGL,
+          entries: [
+            { binding: 0, resource: cellView },
+            { binding: 1, resource: this.mapViews[1 - i] },
+            { binding: 2, resource: this.mapViews[i] },
+            { binding: 3, resource: { buffer: this.state } },
+            { binding: 4, resource: { buffer: this.frameU } }
+          ]
+        });
+      }
+      this.srcW = w;
+      this.srcH = h;
+      this.cellsW = cw;
+      this.cellsH = ch;
+      this.needReset = true;
+      return true;
+    }
+
+    ensureDecoded() {
+      if (this.decTex) return;
+      this.decTex = this.core.device.createTexture({
+        size: [this.srcW, this.srcH, 1],
+        format: 'rgba16float',
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
+      });
+      this.decView = this.decTex.createView();
+    }
+
+    finalBindGroup(srcView, resView, idx) {
+      let byRes = this.finalBGs.get(srcView);
+      if (!byRes) {
+        if (this.finalBGs.size > 6) this.finalBGs.clear();
+        byRes = new Map();
+        this.finalBGs.set(srcView, byRes);
+      }
+      let pair = byRes.get(resView);
+      if (!pair) {
+        if (byRes.size > 6) byRes.clear();
+        const core = this.core;
+        pair = [0, 1].map((i) => core.device.createBindGroup({
+          layout: core.layouts.finalBGL,
+          entries: [
+            { binding: 0, resource: core.sampler },
+            { binding: 1, resource: srcView },
+            { binding: 2, resource: resView },
+            { binding: 3, resource: this.mapViews[i] },
+            { binding: 4, resource: { buffer: this.frameU } },
+            { binding: 5, resource: { buffer: this.sceneU } },
+            { binding: 6, resource: this.lutView }
+          ]
+        }));
+        byRes.set(resView, pair);
+      }
+      return pair[idx];
+    }
+
+    enableTimestamps() {
+      const d = this.core.device;
+      if (this.ts) return true;
+      if (!d.features || !d.features.has('timestamp-query')) return false;
+      try {
+        this.ts = {
+          qs: d.createQuerySet({ type: 'timestamp', count: 2 }),
+          resolve: d.createBuffer({ size: 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC }),
+          read: d.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ }),
+          busy: false,
+          armed: false
+        };
+      } catch (_) {
+        this.ts = null;
+      }
+      return Boolean(this.ts);
+    }
+
+    // Call after queue.submit(); resolves to GPU ms of the last measured frame (or null)
+    readTimestamps() {
+      const ts = this.ts;
+      if (!ts || !ts.armed) return null;
+      ts.armed = false;
+      ts.busy = true;
+      return ts.read.mapAsync(GPUMapMode.READ).then(
+        () => {
+          const a = new BigInt64Array(ts.read.getMappedRange());
+          const ms = Number(a[1] - a[0]) / 1e6;
+          ts.read.unmap();
+          ts.busy = false;
+          return ms > 0 && ms < 1000 ? ms : null;
+        },
+        () => {
+          ts.busy = false;
+          return null;
+        }
+      );
+    }
+
+    /**
+     * p: { srcW, srcH, rect:[ox,oy,w,h] (canvas uv), outW, outH (content px in canvas),
+     *      tone:[peak,thr,punch,gamut], shadowDepth, aplGuard, splitPos, hdr, bypassNativeHdr,
+     *      sharpness, mode:'direct'|'sr'|'spatial', sr:[SRUpscaler], reset, dt, frameSeed, measure }
+     * Returns { srPasses, resW, resH }.
+     */
+    encode(encoder, source, targetView, p) {
+      const core = this.core;
+      const d = core.device;
+      this.ensure(p.srcW, p.srcH);
+      const cur = this.mapIdx = 1 - this.mapIdx;
+      const reset = Boolean(p.reset) || this.needReset;
+      this.needReset = false;
+
+      const dt = Math.min(Math.max(p.dt || 1 / 30, 1 / 240), 0.25);
+      const u = this.u;
+      u[0] = p.rect[0]; u[1] = p.rect[1]; u[2] = p.rect[2]; u[3] = p.rect[3];
+      u[4] = p.tone[0]; u[5] = p.tone[1]; u[6] = p.tone[2]; u[7] = p.tone[3];
+      u[8] = p.shadowDepth;
+      u[9] = p.aplGuard;
+      u[10] = p.splitPos;
+      u[11] = (p.hdr ? 1 : 0) | (p.bypassNativeHdr ? 2 : 0);
+      u[12] = p.srcW; u[13] = p.srcH; u[14] = p.frameSeed || 0; u[15] = reset ? 1 : 0;
+      u[18] = p.sharpness; u[19] = 0;
+      u[20] = p.outW; u[21] = p.outH;
+      u[22] = p.srcW / (CELL * this.cellsW);
+      u[23] = p.srcH / (CELL * this.cellsH);
+      u[24] = 1 - Math.exp(-dt / 0.12);  // APL rising (guard engages)
+      u[25] = 1 - Math.exp(-dt / 0.60);  // APL falling (guard releases)
+      u[26] = 1 - Math.exp(-dt / 0.06);  // local map (and text attack)
+      u[27] = 1 - Math.exp(-dt / 0.40);  // text release
+
+      // p.tsw = { querySet, begin, end } lets the offscreen harness supply its own query slots
+      const tsw = p.tsw || null;
+      const measure = !tsw && Boolean(p.measure) && this.ts && !this.ts.busy;
+      const tsQS = tsw ? tsw.querySet : measure ? this.ts.qs : null;
+      const videoBG = d.createBindGroup({ layout: core.layouts.videoBGL, entries: [{ binding: 0, resource: source }] });
+
+      const tsBegin = tsw ? tsw.begin : 0;
+      const tsEnd = tsw ? tsw.end : 1;
+      const cp = encoder.beginComputePass(tsQS && tsBegin !== undefined
+        ? { timestampWrites: { querySet: tsQS, beginningOfPassWriteIndex: tsBegin } }
+        : undefined);
+      cp.setPipeline(core.pipes.analyze);
+      cp.setBindGroup(0, videoBG);
+      cp.setBindGroup(1, this.anaBG);
+      cp.dispatchWorkgroups(this.groupsW, this.groupsH);
+      cp.setPipeline(core.pipes.stats);
+      cp.setBindGroup(0, this.statsBG);
+      cp.dispatchWorkgroups(1);
+      cp.setPipeline(core.pipes.map);
+      cp.setBindGroup(0, this.mapBGs[cur]);
+      cp.dispatchWorkgroups(this.groupsW, this.groupsH);
+      cp.end();
+      encoder.copyBufferToBuffer(this.state, 0, this.sceneU, 0, 16);
+
+      let pipe = core.pipes.finalDirect;
+      let srcView = core.dummyView;
+      let resView = core.dummyView;
+      let resW = p.srcW;
+      let resH = p.srcH;
+      let srPasses = 0;
+      if (p.mode === 'sr' || p.mode === 'spatial') {
+        this.ensureDecoded();
+        const rp = encoder.beginRenderPass({
+          colorAttachments: [{ view: this.decView, loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }]
+        });
+        rp.setPipeline(core.pipes.decode);
+        rp.setBindGroup(0, videoBG);
+        rp.draw(3);
+        rp.end();
+        srcView = this.decView;
+        if (p.mode === 'sr' && p.sr && p.sr.length) {
+          let view = this.decView;
+          let w = p.srcW;
+          let h = p.srcH;
+          for (const inst of p.sr) {
+            const o = inst.encode(encoder, view, w, h);
+            view = o.view;
+            w = o.width;
+            h = o.height;
+            srPasses++;
+          }
+          resView = view;
+          resW = w;
+          resH = h;
+          pipe = core.pipes.finalSR;
+        } else {
+          pipe = core.pipes.finalSpatial;
+        }
+      }
+      u[16] = resW;
+      u[17] = resH;
+      d.queue.writeBuffer(this.frameU, 0, u);
+
+      const fp = encoder.beginRenderPass({
+        colorAttachments: [{ view: targetView, loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
+        ...(tsQS && tsEnd !== undefined ? { timestampWrites: { querySet: tsQS, endOfPassWriteIndex: tsEnd } } : {})
+      });
+      fp.setPipeline(pipe);
+      fp.setBindGroup(0, videoBG);
+      fp.setBindGroup(1, this.finalBindGroup(srcView, resView, cur));
+      fp.draw(3);
+      fp.end();
+      if (measure) {
+        encoder.resolveQuerySet(this.ts.qs, 0, 2, this.ts.resolve, 0);
+        encoder.copyBufferToBuffer(this.ts.resolve, 0, this.ts.read, 0, 16);
+        this.ts.armed = true;
+      }
+      return { srPasses, resW, resH };
+    }
+
+    destroy() {
+      this.releaseSized();
+      for (const b of [this.frameU, this.sceneU, this.state, this.lutTex]) {
+        try { b.destroy(); } catch (_) {}
+      }
+      if (this.ts) {
+        try { this.ts.qs.destroy(); this.ts.resolve.destroy(); this.ts.read.destroy(); } catch (_) {}
+        this.ts = null;
+      }
+    }
+  }
+
+  const CORE_API = { CELL, STATE_BYTES, SHADER_SOURCES, substituteTexture2D, createCore, FrameRenderer };
+
+  // Offscreen (Deno harness) use: expose the core and stop before any DOM work.
+  if (typeof document === 'undefined' || typeof window === 'undefined') {
+    G.__TRUEHDR_CORE__ = CORE_API;
+    return;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Page integration
+  // ---------------------------------------------------------------------------
+
+  const CHANNEL = '__TRUEHDR_BRIDGE_V1__';
+
+  const DEFAULT_SETTINGS = {
+    enabled: true,
+    hdrEnabled: true,
+    upscaleEnabled: true,
+    preset: 'vivid',
+    peakBoost: 6.0,
+    threshold: 0.46,
+    localPunch: 0.70,
+    gamutBoost: 0.45,
+    shadowDepth: 0.14,
+    aplGuard: 0.45,
+    upscaleQuality: 'quality', // 'fast' | 'quality'
+    upscaleContent: 'live',    // 'live' | 'anime'
+    upscaleSharpness: 0.25,    // 0.0 .. 1.0
+    bypassNativeHdr: true,
+    splitEnabled: false,
+    splitPos: 0.5,
+    effectiveHdr: true,
+    effectiveUpscale: true,
+    effectiveEnabled: true
+  };
+
+  const SR_TIERS = ['quality', 'fast', 'spatial'];
+  const SR_BUDGET_FRACTION = 0.6;   // of the video frame interval
+  const SR_BUDGET_STRIKES = 24;     // over-budget samples (every 4th frame) before stepping down
+
+  let settings = { ...DEFAULT_SETTINGS };
+  let isEdrDisplay = window.matchMedia('(dynamic-range: high)').matches;
+  let gpuState = {
+    status: 'init', // 'init' | 'ready' | 'unsupported' | 'error'
+    device: null,
+    core: null,
+    initPromise: null,
+    errorMsg: null
+  };
+
+  const instances = new Map(); // HTMLVideoElement -> VideoHDRProcessor
+
+  function postToBridge(kind, payload) {
+    window.postMessage({ channel: CHANNEL, from: 'engine', kind, payload }, '*');
+  }
+
+  // Listen for dynamic range changes (e.g., moving window between XDR and external SDR monitor)
+  try {
+    const mq = window.matchMedia('(dynamic-range: high)');
+    mq.addEventListener('change', (e) => {
+      isEdrDisplay = e.matches;
+      for (const inst of instances.values()) {
+        inst.reconfigure();
+        inst.scheduleRenderOnce();
+      }
+      broadcastStatus();
+    });
+  } catch (_) {}
 
   async function ensureGPU() {
     if (gpuState.status === 'ready') return gpuState;
@@ -580,7 +1262,14 @@
           gpuState.errorMsg = 'No WebGPU adapter found.';
           return null;
         }
-        const device = await adapter.requestDevice();
+        const requiredFeatures = ['shader-f16', 'timestamp-query'].filter((f) => adapter.features.has(f));
+        const requiredLimits = { maxTextureDimension2D: adapter.limits.maxTextureDimension2D };
+        let device;
+        try {
+          device = await adapter.requestDevice({ requiredFeatures, requiredLimits });
+        } catch (_) {
+          device = await adapter.requestDevice();
+        }
         device.addEventListener('uncapturederror', (e) => {
           console.error('[TrueHDR] WebGPU uncaptured error:', e.error?.message || e.error);
           gpuState.lastWebGpuError = e.error?.message || String(e.error);
@@ -589,49 +1278,22 @@
           console.warn('[TrueHDR] WebGPU device lost:', info.message);
           gpuState.status = 'init';
           gpuState.device = null;
+          gpuState.core = null;
           gpuState.initPromise = null;
           for (const inst of instances.values()) {
             inst.onDeviceLost();
           }
         });
 
-        const vsModule = device.createShaderModule({ code: FULLSCREEN_VS });
-        const copyModule = device.createShaderModule({ code: COPY_SRC_FS });
-        const restoreModule = device.createShaderModule({ code: RESTORE_FS });
-        const redModule = device.createShaderModule({ code: REDUCE_FS });
-        const hdrModule = device.createShaderModule({ code: HDR_RENDER_FS });
-
-        const sampler = device.createSampler({
-          magFilter: 'linear',
-          minFilter: 'linear',
-          addressModeU: 'clamp-to-edge',
-          addressModeV: 'clamp-to-edge'
-        });
-
-        const makePipe = (mod) =>
-          device.createRenderPipeline({
-            layout: 'auto',
-            vertex: { module: vsModule, entryPoint: 'vsMain' },
-            fragment: {
-              module: mod,
-              entryPoint: 'fsMain',
-              targets: [{ format: 'rgba16float' }]
-            },
-            primitive: { topology: 'triangle-list' }
-          });
-
+        const core = await createCore(device);
         gpuState.device = device;
-        gpuState.sampler = sampler;
-        gpuState.copyPipeline = makePipe(copyModule);
-        gpuState.restorePipeline = makePipe(restoreModule);
-        gpuState.reducePipeline = makePipe(redModule);
-        gpuState.hdrPipeline = makePipe(hdrModule);
+        gpuState.core = core;
         gpuState.status = 'ready';
         return gpuState;
       } catch (err) {
         console.error('[TrueHDR] GPU init failed:', err);
         gpuState.status = 'error';
-        gpuState.errorMsg = String(err);
+        gpuState.errorMsg = String(err && err.message ? err.message : err);
         return null;
       }
     })();
@@ -681,26 +1343,14 @@
       this.video = video;
       this.canvas = null;
       this.ctx = null;
-      this.uniformBuffer = null;
-      this.uniformData = new Float32Array(20);
-      this.srcTex = [null, null];
-      this.srcView = [null, null];
-      this.featTex = null;
-      this.featView = null;
-      this.srcWidth = 0;
-      this.srcHeight = 0;
-      this.srcIndex = 0;
-      this.hasPrevSrc = false;
-      this.stateTex = [null, null];
-      this.stateViews = [null, null];
-      this.restoreBindGroups = [null, null];
-      this.reduceBindGroups = [[null, null], [null, null]];
-      this.hdrBindGroups = [[null, null], [null, null]];
-      this.stateIndex = 0;
+      this.renderer = null;
       this.upscalingActive = false;
       this.resetStateNextFrame = true;
 
-      this.cachedRect = [0, 0, 1, 1];
+      this.cachedRect = [0, 0, 1, 1];   // content rect in the video box (normalized)
+      this.rectUniform = [0, 0, 1, 1];  // content rect in canvas uv
+      this.contentOutW = 0;
+      this.contentOutH = 0;
       this.cachedBoxW = 0;
       this.cachedBoxH = 0;
       this.lastLayoutCheckMs = 0;
@@ -711,12 +1361,34 @@
       this.blockedReason = null;
       this.rvfcId = null;
       this.frameSeed = 0;
+      this.frameCounter = 0;
       this.lastRectKey = '';
       this.configuredWidth = 0;
       this.configuredHeight = 0;
       this.lastReportedSig = '';
-      this.lastRenderTime = -1;
+      this.lastRenderMs = 0;
+      this.lastStatusMs = 0;
       this.destroyed = false;
+
+      // ML super-resolution state
+      this.srInsts = [];
+      this.srKey = '';
+      this.srGen = 0;
+      this.srPending = null;
+      this.srError = null;
+      this.srDemoted = null;     // 'fast' | 'spatial' after the GPU-budget guard steps down
+      this.srBudgetNote = null;
+      this.srModel = null;
+      this.srPasses = 0;
+      this.srFallback = null;
+      this.srCfgKey = '';
+
+      // GPU timing / budget guard
+      this.gpuMs = null;
+      this.gpuPending = false;
+      this.overBudget = 0;
+      this.frameIntervalMs = 1000 / 30;
+      this.lastVfcNow = 0;
 
       this.boundOnFrame = this.onVideoFrame.bind(this);
       this.boundSchedule = this.scheduleLoop.bind(this);
@@ -789,23 +1461,9 @@
         return;
       }
 
-      const device = gpu.device;
-      if (!this.uniformBuffer) {
-        this.uniformBuffer = device.createBuffer({
-          size: 80,
-          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
-        });
-      }
-
-      for (let i = 0; i < 2; i++) {
-        if (!this.stateTex[i]) {
-          this.stateTex[i] = device.createTexture({
-            size: [1, 1, 1],
-            format: 'rgba16float',
-            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
-          });
-          this.stateViews[i] = this.stateTex[i].createView();
-        }
+      if (!this.renderer) {
+        this.renderer = new FrameRenderer(gpu.core);
+        this.renderer.enableTimestamps();
       }
 
       this.ensureCanvas();
@@ -815,95 +1473,42 @@
     }
 
     onDeviceLost() {
-      this.ctx = null;
-      this.uniformBuffer = null;
-      this.releaseSourceTexture();
-      this.stateTex = [null, null];
-      this.stateViews = [null, null];
+      this.releaseGpu();
+      // Keep the canvas/context; the next layout pass re-configures it with the new device
       this.configuredWidth = 0;
       this.configuredHeight = 0;
+      this.lastRectKey = '';
       if (!this.destroyed) {
         this.initResources();
       }
     }
 
-    releaseSourceTexture() {
-      for (let i = 0; i < 2; i++) {
-        if (this.srcTex[i]) {
-          try { this.srcTex[i].destroy(); } catch (_) {}
-        }
-        this.srcTex[i] = null;
-        this.srcView[i] = null;
+    releaseGpu() {
+      this.dropSR();
+      if (this.renderer) {
+        try { this.renderer.destroy(); } catch (_) {}
       }
-      if (this.featTex) {
-        try { this.featTex.destroy(); } catch (_) {}
-      }
-      this.featTex = null;
-      this.featView = null;
-      this.srcWidth = 0;
-      this.srcHeight = 0;
-      this.srcIndex = 0;
-      this.hasPrevSrc = false;
-      this.restoreBindGroups = [null, null];
-      this.reduceBindGroups = [[null, null], [null, null]];
-      this.hdrBindGroups = [[null, null], [null, null]];
+      this.renderer = null;
+      this.gpuMs = null;
+      this.gpuPending = false;
+      this.resetStateNextFrame = true;
     }
 
-    ensureSourceTexture(w, h) {
-      if (this.srcTex[0] && this.srcWidth === w && this.srcHeight === h && this.reduceBindGroups[0][0]) {
-        return true;
+    dropSR() {
+      this.srGen++;
+      for (const inst of this.srInsts) {
+        try { inst.destroy(); } catch (_) {}
       }
-      this.releaseSourceTexture();
-      const device = gpuState.device;
-      if (!device || !this.stateViews[0] || !this.uniformBuffer) return false;
+      this.srInsts = [];
+      this.srPending = null;
+      this.srKey = '';
+      this.srError = null;
+    }
 
-      const texDesc = {
-        size: [w, h, 1],
-        format: 'rgba16float',
-        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
-      };
-      for (let i = 0; i < 2; i++) {
-        this.srcTex[i] = device.createTexture(texDesc);
-        this.srcView[i] = this.srcTex[i].createView();
-      }
-      this.featTex = device.createTexture(texDesc);
-      this.featView = this.featTex.createView();
-      this.srcWidth = w;
-      this.srcHeight = h;
-      this.srcIndex = 0;
-      this.hasPrevSrc = false;
-
-      for (let s = 0; s < 2; s++) {
-        this.restoreBindGroups[s] = device.createBindGroup({
-          layout: gpuState.restorePipeline.getBindGroupLayout(0),
-          entries: [
-            { binding: 0, resource: this.srcView[s] },
-            { binding: 1, resource: this.srcView[1 - s] },
-            { binding: 2, resource: { buffer: this.uniformBuffer } }
-          ]
-        });
-        for (let st = 0; st < 2; st++) {
-          this.reduceBindGroups[s][st] = device.createBindGroup({
-            layout: gpuState.reducePipeline.getBindGroupLayout(0),
-            entries: [
-              { binding: 0, resource: this.srcView[s] },
-              { binding: 1, resource: this.stateViews[st] },
-              { binding: 2, resource: { buffer: this.uniformBuffer } }
-            ]
-          });
-          this.hdrBindGroups[s][st] = device.createBindGroup({
-            layout: gpuState.hdrPipeline.getBindGroupLayout(0),
-            entries: [
-              { binding: 0, resource: gpuState.sampler },
-              { binding: 1, resource: this.srcView[s] },
-              { binding: 2, resource: this.featView },
-              { binding: 3, resource: this.stateViews[st] },
-              { binding: 4, resource: { buffer: this.uniformBuffer } }
-            ]
-          });
-        }
-      }
-      return true;
+    resetSRGuard() {
+      this.srDemoted = null;
+      this.srBudgetNote = null;
+      this.overBudget = 0;
     }
 
     ensureCanvas() {
@@ -911,23 +1516,68 @@
       const parent = this.video.parentElement;
       if (!parent) return;
 
-      const canvas = document.createElement('canvas');
-      canvas.setAttribute('data-truehdr', '1');
-      Object.assign(canvas.style, {
-        position: 'absolute',
-        pointerEvents: 'none',
-        margin: '0',
-        padding: '0',
-        border: '0',
-        background: 'transparent',
-        display: 'none'
-      });
-
+      const make = () => {
+        const c = document.createElement('canvas');
+        c.setAttribute('data-truehdr', '1');
+        Object.assign(c.style, {
+          position: 'absolute',
+          pointerEvents: 'none',
+          margin: '0',
+          padding: '0',
+          border: '0',
+          background: 'transparent',
+          display: 'none'
+        });
+        return c;
+      };
+      const canvas = make();
       this.video.insertAdjacentElement('afterend', canvas);
       this.canvas = canvas;
       this.ctx = canvas.getContext('webgpu');
+      // Focus workaround (dev/focus-test): while Safari is inactive WebKit clamps the headroom of
+      // existing HDR layers to 1.6x. A context configured *after* focus is lost gets fresh
+      // swap-chain surfaces without that clamp (~4.9x). So we render into a twin canvas that is
+      // configured on focus loss, and go back to the original (full 8.8x again) on focus.
+      const twin = make();
+      twin.setAttribute('data-truehdr-twin', '1');
+      canvas.insertAdjacentElement('afterend', twin);
+      this.twin = { canvas: twin, ctx: twin.getContext('webgpu'), on: false, w: 0, h: 0 };
       this.configuredWidth = 0;
       this.configuredHeight = 0;
+      this.lastRectKey = '';
+    }
+
+    // Called every frame and from a focus poll: switch between main and twin canvas.
+    updateFocusTwin() {
+      const tw = this.twin;
+      if (!tw || !this.canvas || gpuState.status !== 'ready') return;
+      if (this.canvas.parentElement && tw.canvas.previousSibling !== this.canvas) {
+        this.canvas.insertAdjacentElement('afterend', tw.canvas);
+      }
+      const want = !document.hasFocus() && this.canvas.style.display !== 'none';
+      if (want && tw.on) {
+        for (const k of ['left', 'top', 'width', 'height', 'zIndex', 'borderRadius']) {
+          if (tw.canvas.style[k] !== this.canvas.style[k]) tw.canvas.style[k] = this.canvas.style[k];
+        }
+      }
+      if (want === tw.on && (!want || (tw.w === this.canvas.width && tw.h === this.canvas.height))) return;
+      if (want) {
+        tw.canvas.width = this.canvas.width;
+        tw.canvas.height = this.canvas.height;
+        tw.w = this.canvas.width;
+        tw.h = this.canvas.height;
+        try {
+          tw.ctx.configure({ device: gpuState.device, format: 'rgba16float', colorSpace: 'display-p3', toneMapping: { mode: 'extended' }, alphaMode: 'premultiplied' });
+        } catch (_) { return; }
+        for (const k of ['left', 'top', 'width', 'height', 'zIndex', 'borderRadius']) tw.canvas.style[k] = this.canvas.style[k];
+        tw.canvas.style.display = 'block';
+        tw.on = true;
+      } else {
+        tw.on = false;
+        tw.canvas.style.display = 'none';
+        try { tw.ctx.unconfigure(); } catch (_) {}
+      }
+      this.scheduleRenderOnce();
     }
 
     reconfigure() {
@@ -969,6 +1619,7 @@
       }
 
       this.resetStateNextFrame = true;
+      this.resetSRGuard();
       this.syncOverlayLayout(true);
       this.scheduleRenderOnce();
       broadcastStatus();
@@ -1014,6 +1665,43 @@
       }
     }
 
+    // Canvas backing size:
+    //  - upscaling (display content > 1.1x source): exact device pixels of the video box
+    //  - otherwise: content at min(source, display) pixels (1:1 texel-aligned when the display is
+    //    larger); the compositor scales the canvas up, so the GPU only shades source pixels.
+    computeCanvasPlan(boxCssW, boxCssH, rect) {
+      const dpr = Math.min(window.devicePixelRatio || 1, 3);
+      const maxDim = gpuState.device ? gpuState.device.limits.maxTextureDimension2D : 8192;
+      const vw = Math.max(1, this.video.videoWidth);
+      const vh = Math.max(1, this.video.videoHeight);
+      const [ox, oy, rw, rh] = rect;
+      const boxW = boxCssW * dpr;
+      const boxH = boxCssH * dpr;
+      const upRatio = Math.max((boxW * rw) / vw, (boxH * rh) / vh);
+      const upscale = Boolean(settings.effectiveUpscale) && upRatio > 1.1;
+
+      if (!upscale && upRatio > 1.0) {
+        let cw = Math.max(1, Math.round(vw / rw));
+        let ch = Math.max(1, Math.round(vh / rh));
+        if (cw <= maxDim && ch <= maxDim) {
+          const offX = Math.round((cw - vw) / 2);
+          const offY = Math.round((ch - vh) / 2);
+          return { upscale, cw, ch, rectUniform: [offX / cw, offY / ch, vw / cw, vh / ch], outW: vw, outH: vh };
+        }
+      }
+      const k = Math.min(1, maxDim / Math.max(boxW, 1), maxDim / Math.max(boxH, 1));
+      const cw = Math.max(1, Math.round(boxW * k));
+      const ch = Math.max(1, Math.round(boxH * k));
+      return {
+        upscale,
+        cw,
+        ch,
+        rectUniform: [ox, oy, rw, rh],
+        outW: Math.max(1, Math.round(cw * rw)),
+        outH: Math.max(1, Math.round(ch * rh))
+      };
+    }
+
     syncOverlayLayout(force = false) {
       if (!this.video.isConnected) {
         this.destroy();
@@ -1038,6 +1726,7 @@
         if (this.canvas.style.display !== 'none') {
           this.canvas.style.display = 'none';
         }
+        this.updateFocusTwin();
         if (this.isActive) {
           this.isActive = false;
           broadcastStatus();
@@ -1050,6 +1739,7 @@
         if (this.canvas.style.display !== 'none') {
           this.canvas.style.display = 'none';
         }
+        this.updateFocusTwin();
         if (this.isActive) {
           this.isActive = false;
           broadcastStatus();
@@ -1071,36 +1761,17 @@
 
       const cs = getComputedStyle(this.video);
       const fit = cs.objectFit || 'contain';
-      const [ox, oy, rw, rh] = this.computeContentRect(vRect.width, vRect.height, fit);
-      this.cachedRect = [ox, oy, rw, rh];
+      const rect = this.computeContentRect(vRect.width, vRect.height, fit);
+      this.cachedRect = rect;
       this.cachedBoxW = vRect.width;
       this.cachedBoxH = vRect.height;
 
-      const dpr = Math.min(window.devicePixelRatio || 1, 2);
-      const maxDim = Math.min(3840, gpuState.device ? gpuState.device.limits.maxTextureDimension2D : 3840);
-      const vw = Math.max(1, this.video.videoWidth);
-      const vh = Math.max(1, this.video.videoHeight);
-      const mode = settings.upscaleMode || 'auto';
-
-      let cw = Math.max(1, Math.min(maxDim, Math.round(vRect.width * dpr)));
-      let ch = Math.max(1, Math.min(maxDim, Math.round(vRect.height * dpr)));
-
-      if (settings.effectiveUpscale && mode === '4k') {
-        const capW = vw >= vh ? Math.min(3840, maxDim) : Math.min(2160, maxDim);
-        const capH = vw >= vh ? Math.min(2160, maxDim) : Math.min(3840, maxDim);
-        const contentW = cw * Math.min(rw, 1.0);
-        const contentH = ch * Math.min(rh, 1.0);
-        const scaleUp = Math.min(
-          capW / Math.max(contentW, 1),
-          capH / Math.max(contentH, 1),
-          maxDim / Math.max(cw, 1),
-          maxDim / Math.max(ch, 1)
-        );
-        if (scaleUp > 1.0) {
-          cw = Math.min(maxDim, Math.round(cw * scaleUp));
-          ch = Math.min(maxDim, Math.round(ch * scaleUp));
-        }
-      }
+      const plan = this.computeCanvasPlan(vRect.width, vRect.height, rect);
+      const cw = plan.cw;
+      const ch = plan.ch;
+      this.rectUniform = plan.rectUniform;
+      this.contentOutW = plan.outW;
+      this.contentOutH = plan.outH;
 
       const rectKey = `${left.toFixed(1)},${top.toFixed(1)},${vRect.width.toFixed(1)},${vRect.height.toFixed(1)},${cw},${ch},${cs.zIndex},${cs.borderRadius}`;
       if (rectKey !== this.lastRectKey) {
@@ -1112,7 +1783,7 @@
         this.canvas.style.zIndex = cs.zIndex === 'auto' ? '0' : cs.zIndex;
         this.canvas.style.borderRadius = cs.borderRadius;
 
-        if (this.canvas.width !== cw || this.canvas.height !== ch) {
+        if (this.canvas.width !== cw || this.canvas.height !== ch || this.configuredWidth === 0) {
           this.canvas.width = cw;
           this.canvas.height = ch;
           this.configuredWidth = cw;
@@ -1121,11 +1792,8 @@
         }
       }
 
-      const contentOutW = Math.round(cw * Math.min(rw, 1.0));
-      const contentOutH = Math.round(ch * Math.min(rh, 1.0));
-      const nextUpscaling = Boolean(settings.effectiveUpscale) && (contentOutW > vw * 1.04 || contentOutH > vh * 1.04);
-      const upscalingChanged = this.upscalingActive !== nextUpscaling;
-      this.upscalingActive = nextUpscaling;
+      const upscalingChanged = this.upscalingActive !== plan.upscale;
+      this.upscalingActive = plan.upscale;
 
       if (this.canvas.style.display !== 'block') {
         this.canvas.style.display = 'block';
@@ -1136,8 +1804,110 @@
       }
     }
 
+    // Decide ML SR vs spatial fallback for this frame; creates runtime instances lazily.
+    planUpscale(vw, vh, outW, outH) {
+      const content = settings.upscaleContent === 'anime' ? 'anime' : 'live';
+      const wantTier = settings.upscaleQuality === 'fast' ? 'fast' : 'quality';
+      const cfgKey = `${content}|${wantTier}`;
+      if (cfgKey !== this.srCfgKey) {
+        this.srCfgKey = cfgKey;
+        this.resetSRGuard();
+      }
+      const tierIdx = Math.max(SR_TIERS.indexOf(wantTier), this.srDemoted ? SR_TIERS.indexOf(this.srDemoted) : 0);
+      const tier = SR_TIERS[tierIdx];
+      const spatial = (why) => ({ mode: 'spatial', sr: null, model: null, fallback: why });
+
+      if (tier === 'spatial') return spatial(this.srBudgetNote || 'spatial');
+      const rt = G.__TRUEHDR_SR__;
+      if (!rt || typeof rt.create !== 'function') return spatial('ML runtime not loaded');
+      const maxDim = gpuState.device.limits.maxTextureDimension2D;
+      if (2 * vw > maxDim || 2 * vh > maxDim) return spatial('source too large for SR');
+
+      // A second 2x instance costs 4x the first (it runs on the 2x image); only chain it when a
+      // plain resample would have to stretch > 1.6x more and the intermediate is <= 1440p.
+      const ratio = Math.max(outW / vw, outH / vh);
+      let passes = 1;
+      if (ratio / 2 > 1.6 && 2 * vh <= 1440 && 4 * vw <= maxDim && 4 * vh <= maxDim) passes = 2;
+
+      const modelId = `tsr-${content}-${tier}`;
+      const insts = this.ensureSRInstances(rt, modelId, passes);
+      if (!insts) return spatial(this.srError || `loading ${modelId}`);
+      return { mode: 'sr', sr: insts, model: modelId, fallback: this.srBudgetNote };
+    }
+
+    ensureSRInstances(rt, modelId, count) {
+      if (this.srKey !== modelId) {
+        this.dropSR();
+        this.srKey = modelId;
+      }
+      if (this.srError) return null;
+      if (!this.srPending && this.srInsts.length < count) {
+        let known = true;
+        try {
+          const list = typeof rt.listModels === 'function' ? rt.listModels() : null;
+          if (Array.isArray(list)) known = list.some((m) => m && m.id === modelId);
+        } catch (_) {}
+        if (!known) {
+          this.srError = `model ${modelId} not available`;
+          return null;
+        }
+        const device = gpuState.device;
+        const gen = this.srGen;
+        this.srPending = Promise.resolve()
+          .then(() => rt.create(device, { modelId, useF16: device.features.has('shader-f16') }))
+          .then(
+            (inst) => {
+              if (gen !== this.srGen || this.destroyed || gpuState.device !== device) {
+                try { inst.destroy(); } catch (_) {}
+                return;
+              }
+              this.srPending = null;
+              this.srInsts.push(inst);
+              this.scheduleRenderOnce();
+              broadcastStatus();
+            },
+            (err) => {
+              if (gen !== this.srGen) return;
+              this.srPending = null;
+              this.srError = `SR init failed: ${err && err.message ? err.message : err}`;
+              console.warn('[TrueHDR]', this.srError);
+              broadcastStatus();
+            }
+          );
+      }
+      if (this.srInsts.length === 0) return null;
+      return this.srInsts.slice(0, Math.min(count, this.srInsts.length));
+    }
+
+    noteGpuTime(ms) {
+      if (typeof ms !== 'number' || !(ms >= 0) || !isFinite(ms)) return;
+      this.gpuMs = this.gpuMs == null ? ms : this.gpuMs * 0.8 + ms * 0.2;
+      if (this.srPasses === 0) {
+        this.overBudget = 0;
+        return;
+      }
+      const budget = SR_BUDGET_FRACTION * this.frameIntervalMs;
+      if (this.gpuMs > budget) {
+        this.overBudget++;
+      } else {
+        this.overBudget = Math.max(0, this.overBudget - 2);
+      }
+      if (this.overBudget >= SR_BUDGET_STRIKES) {
+        const wantTier = settings.upscaleQuality === 'fast' ? 'fast' : 'quality';
+        const from = SR_TIERS[Math.max(SR_TIERS.indexOf(wantTier), this.srDemoted ? SR_TIERS.indexOf(this.srDemoted) : 0)];
+        const to = SR_TIERS[Math.min(SR_TIERS.indexOf(from) + 1, SR_TIERS.length - 1)];
+        this.srDemoted = to;
+        this.srBudgetNote = `GPU ${this.gpuMs.toFixed(1)} ms > ${budget.toFixed(1)} ms budget: ${from} -> ${to}`;
+        console.warn('[TrueHDR]', this.srBudgetNote);
+        this.overBudget = 0;
+        this.gpuMs = null;
+        this.dropSR();
+        broadcastStatus();
+      }
+    }
+
     renderFrame() {
-      if (this.destroyed || gpuState.status !== 'ready') return;
+      if (this.destroyed || gpuState.status !== 'ready' || !this.renderer) return;
       this.syncOverlayLayout(false);
       if (!this.shouldRender() || !this.ctx || !this.canvas) return;
       if (this.cachedBoxW < 96 || this.cachedBoxH < 64) return;
@@ -1147,6 +1917,11 @@
       }
 
       const device = gpuState.device;
+      const vw = this.video.videoWidth;
+      const vh = this.video.videoHeight;
+      const maxDim = device.limits.maxTextureDimension2D;
+      if (vw < 1 || vh < 1 || vw > maxDim || vh > maxDim) return;
+
       let externalTex;
       try {
         externalTex = device.importExternalTexture({ source: this.video });
@@ -1162,9 +1937,12 @@
       }
 
       let swapTex;
+      this.updateFocusTwin();
+      const outCtx = this.twin && this.twin.on ? this.twin.ctx : this.ctx;
       try {
-        swapTex = this.ctx.getCurrentTexture();
+        swapTex = outCtx.getCurrentTexture();
       } catch (_) {
+        if (outCtx !== this.ctx) return;
         this.reconfigure();
         try {
           swapTex = this.ctx.getCurrentTexture();
@@ -1173,137 +1951,96 @@
         }
       }
 
-      const vw = Math.max(1, Math.min(3840, this.video.videoWidth));
-      const vh = Math.max(1, Math.min(3840, this.video.videoHeight));
-      if (!this.ensureSourceTexture(vw, vh)) return;
+      const plan = this.upscalingActive
+        ? this.planUpscale(vw, vh, this.contentOutW, this.contentOutH)
+        : { mode: 'direct', sr: null, model: null, fallback: null };
 
-      const [ox, oy, rw, rh] = this.cachedRect;
-      const u = this.uniformData;
-      u[0] = ox;
-      u[1] = oy;
-      u[2] = rw;
-      u[3] = rh;
-
-      u[4] = settings.peakBoost;
-      u[5] = settings.threshold;
-      u[6] = settings.localPunch;
-      u[7] = settings.gamutBoost;
-
-      u[8] = settings.shadowDepth;
-      u[9] = settings.aplGuard;
-      u[10] = settings.splitEnabled ? settings.splitPos : -1.0;
-      let flags = 0;
-      if (settings.effectiveHdr) flags |= 1;
-      if (settings.bypassNativeHdr) flags |= 2;
-      u[11] = flags;
-
+      const now = performance.now();
+      const dt = this.lastRenderMs > 0 ? (now - this.lastRenderMs) / 1000 : 1 / 30;
+      this.lastRenderMs = now;
       this.frameSeed = (this.frameSeed + 1) % 256;
-      const resetAll = this.resetStateNextFrame || !this.hasPrevSrc;
-      u[12] = 1.0 / vw;
-      u[13] = 1.0 / vh;
-      u[14] = this.frameSeed;
-      u[15] = resetAll ? 1.0 : 0.0;
+      const reset = this.resetStateNextFrame;
       this.resetStateNextFrame = false;
-
-      const contentOutW = Math.round(this.configuredWidth * Math.min(rw, 1.0));
-      const contentOutH = Math.round(this.configuredHeight * Math.min(rh, 1.0));
-      const shouldUpscale = Boolean(settings.effectiveUpscale) && (contentOutW > vw * 1.04 || contentOutH > vh * 1.04);
-
-      const sig = `${vw}x${vh}->${contentOutW}x${contentOutH}|${Boolean(settings.effectiveHdr)}|${shouldUpscale}`;
-      if (this.upscalingActive !== shouldUpscale || this.lastReportedSig !== sig) {
-        this.upscalingActive = shouldUpscale;
-        this.lastReportedSig = sig;
-        broadcastStatus();
-      }
-
-      u[16] = vw;
-      u[17] = vh;
-      u[18] = typeof settings.upscaleSharpness === 'number' ? settings.upscaleSharpness : 0.55;
-      u[19] = shouldUpscale ? 1.0 : 0.0;
-
-      device.queue.writeBuffer(this.uniformBuffer, 0, u);
-
-      const prevIdx = this.stateIndex;
-      const nextIdx = 1 - prevIdx;
-      this.stateIndex = nextIdx;
-
-      const currSrcIdx = 1 - this.srcIndex;
-      this.srcIndex = currSrcIdx;
-      this.hasPrevSrc = true;
+      const measure = (this.frameCounter++ & 3) === 0;
 
       const encoder = device.createCommandEncoder();
-
-      // Pass 0: Copy + linearize external texture once at native video resolution
-      const copyBindGroup = device.createBindGroup({
-        layout: gpuState.copyPipeline.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: gpuState.sampler },
-          { binding: 1, resource: externalTex }
-        ]
-      });
-      const copyPass = encoder.beginRenderPass({
-        colorAttachments: [{
-          view: this.srcView[currSrcIdx],
-          loadOp: 'clear',
-          storeOp: 'store',
-          clearValue: { r: 0, g: 0, b: 0, a: 1 }
-        }]
-      });
-      copyPass.setPipeline(gpuState.copyPipeline);
-      copyPass.setBindGroup(0, copyBindGroup);
-      copyPass.draw(3);
-      copyPass.end();
-
-      // Pass 1: 1x1 Temporal EMA scene statistics directly from srcTex[currSrcIdx]
-      const redPass = encoder.beginRenderPass({
-        colorAttachments: [{
-          view: this.stateViews[nextIdx],
-          loadOp: 'clear',
-          storeOp: 'store',
-          clearValue: { r: 0, g: 0, b: 0, a: 1 }
-        }]
-      });
-      redPass.setPipeline(gpuState.reducePipeline);
-      redPass.setBindGroup(0, this.reduceBindGroups[currSrcIdx][prevIdx]);
-      redPass.draw(3);
-      redPass.end();
-
-      // Pass 1b: Source-Resolution Super-Resolution Feature Restoration (only when upscaling)
-      if (shouldUpscale) {
-        const restorePass = encoder.beginRenderPass({
-          colorAttachments: [{
-            view: this.featView,
-            loadOp: 'clear',
-            storeOp: 'store',
-            clearValue: { r: 0, g: 0, b: 0, a: 1 }
-          }]
+      let result;
+      try {
+        result = this.renderer.encode(encoder, externalTex, swapTex.createView(), {
+          srcW: vw,
+          srcH: vh,
+          rect: this.rectUniform,
+          outW: this.contentOutW,
+          outH: this.contentOutH,
+          tone: [settings.peakBoost, settings.threshold, settings.localPunch, settings.gamutBoost],
+          shadowDepth: settings.shadowDepth,
+          aplGuard: settings.aplGuard,
+          splitPos: settings.splitEnabled ? settings.splitPos : -1.0,
+          hdr: Boolean(settings.effectiveHdr),
+          bypassNativeHdr: Boolean(settings.bypassNativeHdr),
+          sharpness: typeof settings.upscaleSharpness === 'number' ? settings.upscaleSharpness : DEFAULT_SETTINGS.upscaleSharpness,
+          mode: plan.mode,
+          sr: plan.sr,
+          reset,
+          dt,
+          frameSeed: this.frameSeed,
+          measure
         });
-        restorePass.setPipeline(gpuState.restorePipeline);
-        restorePass.setBindGroup(0, this.restoreBindGroups[currSrcIdx]);
-        restorePass.draw(3);
-        restorePass.end();
+      } catch (err) {
+        console.warn('[TrueHDR] Frame encode failed:', err);
+        if (plan.mode === 'sr') {
+          this.dropSR();
+          this.srKey = plan.model || '';
+          this.srError = `SR encode failed: ${err && err.message ? err.message : err}`;
+          broadcastStatus();
+        }
+        this.resetStateNextFrame = true;
+        return;
+      }
+      device.queue.submit([encoder.finish()]);
+
+      if (measure) {
+        const tsPromise = this.renderer.readTimestamps();
+        if (tsPromise) {
+          tsPromise.then((ms) => this.noteGpuTime(ms));
+        } else if (!this.gpuPending) {
+          this.gpuPending = true;
+          const t0 = performance.now();
+          device.queue.onSubmittedWorkDone().then(() => {
+            this.gpuPending = false;
+            this.noteGpuTime(performance.now() - t0);
+          }, () => {
+            this.gpuPending = false;
+          });
+        }
       }
 
-      // Pass 2: Super-Resolution (EASU 12-tap + Halo-Free RCAS) + True-EDR Display-P3 output to float16 swapchain
-      const hdrPass = encoder.beginRenderPass({
-        colorAttachments: [{
-          view: swapTex.createView(),
-          loadOp: 'clear',
-          storeOp: 'store',
-          clearValue: { r: 0, g: 0, b: 0, a: 1 }
-        }]
-      });
-      hdrPass.setPipeline(gpuState.hdrPipeline);
-      hdrPass.setBindGroup(0, this.hdrBindGroups[currSrcIdx][nextIdx]);
-      hdrPass.draw(3);
-      hdrPass.end();
-
-      device.queue.submit([encoder.finish()]);
+      const srModel = plan.mode === 'sr' ? plan.model : null;
+      const srFallback = plan.mode === 'sr' ? plan.fallback : (this.upscalingActive ? plan.fallback : null);
+      this.srPasses = result.srPasses;
+      const sig = `${vw}x${vh}->${this.contentOutW}x${this.contentOutH}|${Boolean(settings.effectiveHdr)}|${this.upscalingActive}|${srModel}|${result.srPasses}|${srFallback}`;
+      if (this.lastReportedSig !== sig || this.srModel !== srModel || this.srFallback !== srFallback) {
+        this.srModel = srModel;
+        this.srFallback = srFallback;
+        this.lastReportedSig = sig;
+        this.lastStatusMs = now;
+        broadcastStatus();
+      } else if (now - this.lastStatusMs > 2000) {
+        this.lastStatusMs = now;
+        broadcastStatus();
+      }
     }
 
-    onVideoFrame() {
+    onVideoFrame(now) {
       this.rvfcId = null;
       if (this.destroyed) return;
+      if (typeof now === 'number') {
+        if (this.lastVfcNow > 0) {
+          const d = now - this.lastVfcNow;
+          if (d > 4 && d < 150) this.frameIntervalMs = this.frameIntervalMs * 0.9 + d * 0.1;
+        }
+        this.lastVfcNow = now;
+      }
       this.renderFrame();
       if (!this.video.paused && !this.video.ended && this.isVisible && settings.effectiveEnabled) {
         this.scheduleLoop();
@@ -1382,7 +2119,10 @@
       if (this.canvas && this.canvas.parentElement) {
         this.canvas.remove();
       }
-      this.releaseSourceTexture();
+      if (this.twin && this.twin.canvas.parentElement) {
+        this.twin.canvas.remove();
+      }
+      this.releaseGpu();
       instances.delete(this.video);
       broadcastStatus();
     }
@@ -1413,6 +2153,10 @@
       let sourceRes = null;
       let outputRes = null;
       let upscalingActive = false;
+      let srModel = null;
+      let srPasses = 0;
+      let srFallback = null;
+      let gpuMs = null;
 
       for (const inst of instances.values()) {
         if (!inst.video.isConnected) {
@@ -1424,12 +2168,12 @@
           activeCount++;
           if (!sourceRes && inst.video.videoWidth > 0) {
             sourceRes = `${inst.video.videoWidth}×${inst.video.videoHeight}`;
-            const rw = Math.min(inst.cachedRect[2] || 1, 1);
-            const rh = Math.min(inst.cachedRect[3] || 1, 1);
-            const outW = Math.round(inst.configuredWidth * rw);
-            const outH = Math.round(inst.configuredHeight * rh);
-            outputRes = `${outW}×${outH}`;
+            outputRes = `${inst.contentOutW}×${inst.contentOutH}`;
             upscalingActive = inst.upscalingActive;
+            srModel = inst.upscalingActive ? inst.srModel : null;
+            srPasses = inst.upscalingActive && inst.srModel ? inst.srPasses : 0;
+            srFallback = inst.upscalingActive ? inst.srFallback : null;
+            gpuMs = typeof inst.gpuMs === 'number' ? Math.round(inst.gpuMs * 100) / 100 : null;
           }
         }
         if (inst.nativeHdrDetected && settings.bypassNativeHdr) bypassedNativeHdr = true;
@@ -1450,7 +2194,11 @@
         blockedReason,
         sourceRes,
         outputRes,
-        upscalingActive
+        upscalingActive,
+        srModel,
+        srPasses,
+        srFallback,
+        gpuMs
       });
     }, 80);
   }
@@ -1500,6 +2248,13 @@
     },
     true
   );
+
+  // Focus twin canvas switching (see updateFocusTwin): events when web content had focus,
+  // plus a cheap poll for the cases where blur/focus never reach the page.
+  const refreshTwins = () => { for (const inst of instances.values()) inst.updateFocusTwin(); };
+  window.addEventListener('blur', refreshTwins);
+  window.addEventListener('focus', refreshTwins);
+  setInterval(() => { if (instances.size) refreshTwins(); }, 500);
 
   window.addEventListener('yt-navigate-finish', () => {
     setTimeout(() => {
@@ -1557,13 +2312,17 @@
       const prevEnabled = settings.effectiveEnabled;
       const prevHdr = settings.effectiveHdr;
       const prevUp = settings.effectiveUpscale;
-      const prevMode = settings.upscaleMode;
+      const prevSrCfg = `${settings.upscaleQuality}|${settings.upscaleContent}`;
       const incoming = { ...DEFAULT_SETTINGS, ...(data.payload || {}) };
-      if (incoming.upscaleMode === 'off') {
-        if (!data.payload || typeof data.payload.upscaleEnabled !== 'boolean') {
-          incoming.upscaleEnabled = false;
-        }
-        incoming.upscaleMode = 'auto';
+      // Legacy stored setting: upscaleMode 'off' meant upscaling disabled (the mode itself is ignored)
+      if (incoming.upscaleMode === 'off' && (!data.payload || typeof data.payload.upscaleEnabled !== 'boolean')) {
+        incoming.upscaleEnabled = false;
+      }
+      if (incoming.upscaleQuality !== 'fast' && incoming.upscaleQuality !== 'quality') {
+        incoming.upscaleQuality = DEFAULT_SETTINGS.upscaleQuality;
+      }
+      if (incoming.upscaleContent !== 'live' && incoming.upscaleContent !== 'anime') {
+        incoming.upscaleContent = DEFAULT_SETTINGS.upscaleContent;
       }
       if (!data.payload || typeof data.payload.effectiveHdr !== 'boolean') {
         incoming.effectiveHdr = Boolean(incoming.enabled && incoming.hdrEnabled);
@@ -1575,8 +2334,10 @@
         incoming.effectiveEnabled = Boolean(incoming.effectiveHdr || incoming.effectiveUpscale);
       }
       settings = incoming;
-      const needsLayout = prevMode !== settings.upscaleMode || prevEnabled !== settings.effectiveEnabled || prevHdr !== settings.effectiveHdr || prevUp !== settings.effectiveUpscale;
+      const srCfgChanged = prevSrCfg !== `${settings.upscaleQuality}|${settings.upscaleContent}`;
+      const needsLayout = srCfgChanged || prevEnabled !== settings.effectiveEnabled || prevHdr !== settings.effectiveHdr || prevUp !== settings.effectiveUpscale;
       for (const inst of instances.values()) {
+        if (srCfgChanged) inst.resetSRGuard();
         inst.syncOverlayLayout(needsLayout);
         if (settings.effectiveEnabled) {
           if (needsLayout) {

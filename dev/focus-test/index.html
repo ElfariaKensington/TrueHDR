@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EDR Focus Test</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; background: #000; color: #bbb; font: 12px/1.35 ui-monospace, Menlo, monospace; }
+  body { padding: 8px 16px; }
+  h2 { font-size: 12px; margin: 10px 0 4px; color: #888; font-weight: normal; }
+  #status { color: #ddd; white-space: pre; }
+  .row { display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
+  .cell { display: flex; flex-direction: column; gap: 2px; }
+  .cell span { color: #777; }
+  canvas, img, video { display: block; background: #000; }
+  .lim-standard { dynamic-range-limit: standard; }
+  .lim-constrained { dynamic-range-limit: constrained; }
+  .lim-nolimit { dynamic-range-limit: no-limit; }
+  #log { margin-top: 10px; max-height: 40vh; overflow: auto; white-space: pre-wrap; color: #8a8; }
+</style>
+</head>
+<body>
+<div id="status">loading…</div>
+
+<h2>A. WebGPU rgba16float / display-p3 / toneMapping extended (written values 0.5 1 1.25 1.5 2 3 4)</h2>
+<div class="row"><canvas id="gpuMain" data-values="0.5,1,1.25,1.5,2,3,4"></canvas></div>
+
+<h2>B. WebGPU, CSS dynamic-range-limit variants (values 1 2 4)</h2>
+<div class="row" id="limits">
+  <div class="cell"><canvas id="gpuDefault" data-values="1,2,4"></canvas><span>(none)</span></div>
+  <div class="cell"><canvas id="gpuStandard" class="lim-standard" data-values="1,2,4"></canvas><span>standard</span></div>
+  <div class="cell"><canvas id="gpuConstrained" class="lim-constrained" data-values="1,2,4"></canvas><span>constrained</span></div>
+  <div class="cell"><canvas id="gpuNoLimit" class="lim-nolimit" data-values="1,2,4"></canvas><span>no-limit</span></div>
+  <div class="cell lim-nolimit"><div><canvas id="gpuAncestor" data-values="1,2,4"></canvas></div><span>ancestor no-limit</span></div>
+</div>
+
+<h2>C. 2D canvas (display-p3, float16 if supported) · D. HDR &lt;img&gt; (gain-map HEIC, linear 1 2 4) · E. HDR &lt;video&gt; (PQ 203/406/812 nits)</h2>
+<div class="row">
+  <div class="cell"><canvas id="c2d" data-values="1,2,4"></canvas><span id="c2dInfo">2d</span></div>
+  <div class="cell" id="imgCell"><img id="hdrImg" src="assets/patches-hdr.heic" width="270" height="90" alt="HDR patches"><span>img</span></div>
+  <div class="cell" id="videoCell"><video id="hdrVideo" src="assets/patches-pq.mp4" width="270" height="90" muted loop autoplay playsinline></video><span>video</span></div>
+</div>
+
+<pre id="log"></pre>
+<script src="main.js"></script>
+</body>
+</html>

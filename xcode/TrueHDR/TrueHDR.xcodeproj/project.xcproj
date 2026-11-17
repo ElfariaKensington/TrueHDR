@@ -69,6 +69,8 @@
             { "path": "../../../extension/icons", "target-membership": [ "TrueHDR Extension/resources" ] },
             { "path": "../../../extension/manifest.json", "target-membership": [ "TrueHDR Extension/resources" ] },
             { "path": "../../../extension/hdr-engine.js", "target-membership": [ "TrueHDR Extension/resources" ] },
+            { "path": "../../../extension/sr-runtime.js", "target-membership": [ "TrueHDR Extension/resources" ] },
+            { "path": "../../../extension/sr-models.js", "target-membership": [ "TrueHDR Extension/resources" ] },
             { "path": "../../../extension/popup.css", "target-membership": [ "TrueHDR Extension/resources" ] },
           ],
         },

@@ -11,23 +11,34 @@ const DEFAULT_SETTINGS = {
   gamutBoost: 0.45,
   shadowDepth: 0.14,
   aplGuard: 0.45,
-  upscaleMode: 'auto',
-  upscaleSharpness: 0.55,
+  upscaleQuality: 'quality',
+  upscaleContent: 'live',
+  upscaleSharpness: 0.25,
   bypassNativeHdr: true,
   splitEnabled: false,
   splitPos: 0.5,
-  disabledSites: {}
+  disabledSites: {},
+  settingsVersion: 2
 };
 
-function normalizeSettings(raw) {
+function migrateSettings(raw) {
   const merged = { ...DEFAULT_SETTINGS, ...(raw || {}) };
-  if (merged.upscaleMode === 'off') {
-    if (!raw || typeof raw.upscaleEnabled !== 'boolean') {
-      merged.upscaleEnabled = false;
-    }
-    merged.upscaleMode = 'auto';
+  const legacy = !raw || raw.settingsVersion !== DEFAULT_SETTINGS.settingsVersion;
+  // Legacy 'upscaleMode': only 'off' carries meaning (auto/4k targets are gone).
+  if (merged.upscaleMode === 'off' && (!raw || typeof raw.upscaleEnabled !== 'boolean')) {
+    merged.upscaleEnabled = false;
   }
+  delete merged.upscaleMode;
+  // Sharpness is now an optional post-sharpen on top of AI SR: old default 0.55 -> 0.25.
+  if (legacy && raw && raw.upscaleSharpness === 0.55) merged.upscaleSharpness = 0.25;
+  if (merged.upscaleQuality !== 'fast' && merged.upscaleQuality !== 'quality') merged.upscaleQuality = DEFAULT_SETTINGS.upscaleQuality;
+  if (merged.upscaleContent !== 'live' && merged.upscaleContent !== 'anime') merged.upscaleContent = DEFAULT_SETTINGS.upscaleContent;
+  merged.settingsVersion = DEFAULT_SETTINGS.settingsVersion;
   return merged;
+}
+
+function normalizeSettings(raw) {
+  return migrateSettings(raw);
 }
 
 const PRESETS = {
@@ -98,12 +109,16 @@ function renderUI() {
     btn.classList.toggle('active', btn.dataset.preset === settings.preset);
   }
 
-  for (const btn of document.querySelectorAll('.upscale-btn')) {
-    btn.classList.toggle('active', btn.dataset.upscale === (settings.upscaleMode || 'auto'));
+  for (const btn of document.querySelectorAll('.upscale-btn[data-quality]')) {
+    btn.classList.toggle('active', btn.dataset.quality === settings.upscaleQuality);
+  }
+  for (const btn of document.querySelectorAll('.upscale-btn[data-content]')) {
+    btn.classList.toggle('active', btn.dataset.content === settings.upscaleContent);
   }
 
-  el('upscaleSharpness').value = settings.upscaleSharpness ?? 0.55;
-  el('upscaleSharpnessVal').textContent = `${Math.round((settings.upscaleSharpness ?? 0.55) * 100)}%`;
+  const sharp = settings.upscaleSharpness ?? DEFAULT_SETTINGS.upscaleSharpness;
+  el('upscaleSharpness').value = sharp;
+  el('upscaleSharpnessVal').textContent = `${Math.round(sharp * 100)}%`;
 
   el('peakBoost').value = settings.peakBoost;
   el('peakBoostVal').textContent = `${Number(settings.peakBoost).toFixed(1)}×`;
@@ -131,6 +146,27 @@ function renderUI() {
   el('bypassNativeHdr').checked = Boolean(settings.bypassNativeHdr);
 }
 
+function fmtRes(res) {
+  return String(res).replace(/(\d)\s*[x×]\s*(\d)/, '$1×$2');
+}
+
+// e.g. "1280×720 → 2880×1620 · AI 2× Quality · 3.1 ms · fallback: <reason>"
+function srDetail(status) {
+  const parts = [];
+  if (status.sourceRes && status.outputRes) parts.push(`${fmtRes(status.sourceRes)} → ${fmtRes(status.outputRes)}`);
+  const passes = Number(status.srPasses);
+  const scale = Number.isFinite(passes) && passes > 0 ? `${2 ** passes}× ` : '';
+  const model = typeof status.srModel === 'string' ? status.srModel : '';
+  const tier = /fast/i.test(model) ? 'Fast'
+    : /quality/i.test(model) ? 'Quality'
+    : (settings.upscaleQuality === 'fast' ? 'Fast' : 'Quality');
+  parts.push(`AI ${scale}${tier}`);
+  const gpuMs = Number(status.gpuMs);
+  if (status.gpuMs != null && Number.isFinite(gpuMs)) parts.push(`${gpuMs.toFixed(1)} ms`);
+  if (status.srFallback) parts.push(`fallback: ${status.srFallback}`);
+  return parts.join(' · ');
+}
+
 function renderStatus(status) {
   const badge = el('statusBadge');
   const detail = el('statusDetail');
@@ -145,7 +181,7 @@ function renderStatus(status) {
   } else {
     resBadge.textContent = status && status.sourceRes && status.outputRes
       ? `${status.sourceRes} → ${status.outputRes}`
-      : (settings.upscaleMode === '4k' ? 'Target 4K' : 'Auto 4K');
+      : 'Native';
   }
 
   if (!settings.enabled) {
@@ -212,18 +248,18 @@ function renderStatus(status) {
     const upActive = Boolean(status.upscalingActive);
     if (hdrActive && status.isEdrDisplay) {
       badge.classList.add('badge-edr');
-      badge.textContent = upActive ? 'EDR + 4K' : 'EDR Active';
+      badge.textContent = upActive ? 'EDR + AI SR' : 'EDR Active';
       detail.textContent = upActive
-        ? `Float16 Display-P3 HDR + GPU Upscale`
+        ? srDetail(status)
         : `Float16 Display-P3 HDR (${status.activeCount} video${status.activeCount > 1 ? 's' : ''})`;
     } else if (hdrActive && !status.isEdrDisplay) {
       badge.classList.add('badge-sdr');
-      badge.textContent = upActive ? 'SDR + 4K' : 'SDR Display';
+      badge.textContent = upActive ? 'SDR + AI SR' : 'SDR Display';
       detail.textContent = 'Move window to an HDR/XDR screen for full peak brightness';
     } else if (upActive) {
       badge.classList.add('badge-native');
-      badge.textContent = '4K Upscale';
-      detail.textContent = `GPU Super-Resolution active (HDR off)`;
+      badge.textContent = 'AI SR';
+      detail.textContent = srDetail(status);
     } else {
       badge.classList.add('badge-idle');
       badge.textContent = 'Passthrough';
@@ -340,7 +376,8 @@ async function init() {
 
   for (const btn of document.querySelectorAll('.upscale-btn')) {
     btn.addEventListener('click', () => {
-      settings.upscaleMode = btn.dataset.upscale;
+      if (btn.dataset.quality) settings.upscaleQuality = btn.dataset.quality;
+      if (btn.dataset.content) settings.upscaleContent = btn.dataset.content;
       settings.upscaleEnabled = true;
       renderUI();
       saveSettings(true);

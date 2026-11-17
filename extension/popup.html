@@ -37,10 +37,10 @@
 
     <section class="section">
       <div class="section-head">
-        <div class="section-label">4K Super-Resolution</div>
+        <div class="section-label">AI Super-Resolution</div>
         <div class="section-right">
           <span id="resBadge" class="res-pill">—</span>
-          <label class="switch switch-sm" title="Enable 4K GPU Upscaling">
+          <label class="switch switch-sm" title="Enable AI upscaling">
             <input type="checkbox" id="upscaleToggle" />
             <span class="slider-track"></span>
           </label>
@@ -48,13 +48,18 @@
       </div>
       <div id="upscaleBody" class="section-body">
         <div class="presets presets-2">
-          <button class="upscale-btn" data-upscale="auto" type="button">Auto Display</button>
-          <button class="upscale-btn" data-upscale="4k" type="button">Force 4K</button>
+          <button class="upscale-btn" data-quality="fast" type="button">Fast</button>
+          <button class="upscale-btn" data-quality="quality" type="button">Quality</button>
         </div>
+        <div class="presets presets-2">
+          <button class="upscale-btn" data-content="live" type="button">Live action</button>
+          <button class="upscale-btn" data-content="anime" type="button">Animation</button>
+        </div>
+        <p class="hint">Upscales to your display's native resolution with a neural network on the GPU.</p>
         <div id="sharpnessRow" class="control">
           <div class="control-head">
-            <label for="upscaleSharpness">Detail Sharpness</label>
-            <span id="upscaleSharpnessVal" class="val">55%</span>
+            <label for="upscaleSharpness">Extra Sharpening</label>
+            <span id="upscaleSharpnessVal" class="val">25%</span>
           </div>
           <input id="upscaleSharpness" type="range" min="0" max="1.0" step="0.05" />
         </div>

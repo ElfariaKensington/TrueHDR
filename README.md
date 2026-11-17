@@ -10,9 +10,10 @@ Instead of applying SDR contrast/saturation CSS filters, **TrueHDR** intercepts 
    - **Pass 2 (Inverse Tone Mapping + Display P3)**: Anchors skin tones and midtones near SDR reference, smoothly expands compressed highlights above the knee up to `8.0×` SDR white into hardware EDR headroom, isolates local specular highlights (sparks, streetlamps, reflections, neon), converts Rec.709 → Display P3 with controlled wide-gamut saturation, and applies triangular-PDF dithering to remove 8-bit YouTube banding.
    - **White-Screen Guard**: Automatically attenuates peak EDR boost on bright full-screen slides/pages so text and white backgrounds stay comfortable.
    - **Native HDR Auto-Bypass**: Detects native PQ/HLG video frames via `VideoFrame.colorSpace.transfer` (and pixel peaks `> 1.03`) and passes them through untouched.
-2. **True 4K GPU Super-Resolution (EASU + RCAS)**:
-   - Uses a 12-tap texel-locked edge-directed Lanczos-2 reconstruction shader (`UPSCALE_FS`) with `[min2x2, max2x2]` anti-ringing into an `rgba16float` target up to **4K (`3840×2160`)**, followed by 1:1 perceptual **RCAS (Robust Contrast-Adaptive Sharpening)**.
-   - Modes: `Off`, `Auto Display` (upscales to exact Retina/4K panel resolution whenever display > source), or `Force 4K` (always reconstructs up to `3840×2160`).
+2. **AI Super-Resolution (`extension/sr-runtime.js`, `extension/sr-models.js`)**:
+   - A small CNN runs per frame in WebGPU compute shaders (Safari's WebGPU runs on Metal; f16 when `shader-f16` is available), upscaling 2× per pass up to your display's **native resolution**. MetalFX cannot reach Safari's video frames, so this follows the per-frame ML video SR approach.
+   - Models are trained on YouTube-like compression damage (blocking, banding, softened detail) and reconstruct luma; colour is carried by a matched bicubic path.
+   - Options: **Fast** / **Quality** model tier, **Live action** / **Animation** content, plus optional **Extra Sharpening** on top of the AI output.
 3. **YouTube & Web Player Integration**:
    - Attaches seamlessly inside `.html5-video-container` (below player controls, subtitles, and menus) and automatically tracks Theater Mode, Fullscreen, Shorts, and `object-fit` letterboxing.
    - Only renders when new video frames arrive (`requestVideoFrameCallback`), using `0%` GPU when paused.
@@ -24,6 +25,6 @@ Instead of applying SDR contrast/saturation CSS filters, **TrueHDR** intercepts 
 ## Installing & Enabling in Safari
 1. Launch the signed app at `build/Build/Products/Release/TrueHDR.app` once (signed with `Apple Development: elfametesar@gmail.com (N77M7JPZ84)`, Team `RTFTQ673C9`).
 2. Open **Safari → Settings → Extensions**, enable **TrueHDR**, and grant website access (**Always Allow on Every Website** or per-site for `youtube.com`).
-3. Play any SDR YouTube video on your XDR/HDR display and click the **TrueHDR** toolbar button to adjust presets, peak brightness, and split-screen comparison!
+3. Play any SDR YouTube video on your XDR/HDR display and click the **TrueHDR** toolbar button to adjust presets, peak brightness, AI upscaling, and split-screen comparison!
 
 *(Note: If you ever rebuild and Safari still doesn't list a locally dev-signed extension depending on Safari's unsigned/dev policy, enable **Safari → Settings → Advanced → Show features for web developers** and **Develop → Allow Unsigned Extensions**.)*
