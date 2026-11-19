@@ -671,7 +671,7 @@
       let invR = 1.0 / max(R, vec2f(1.0));
       let stepR = clamp(s, vec2f(0.5), vec2f(1.35)) * invR;
       if (max(s.x, s.y) < 0.85) {
-        // Large post-SR magnification (e.g. 720p -> 1440p AI SR -> 4K display):
+        // Large post-SR magnification (e.g. 480p/720p -> 4K display):
         // directional 12-tap EASU contour reconstruction + RCAS 4K detail pop.
         let base = easuSR(vuv, R);
         let n = textureSampleLevel(resTex, samp, vuv + vec2f(0.0, -stepR.y), 0.0).rgb;
@@ -680,55 +680,8 @@
         let w = textureSampleLevel(resTex, samp, vuv + vec2f(-stepR.x, 0.0), 0.0).rgb;
         return rcasContrast(base, n, sb, e, w, sharp);
       }
-      if (max(s.x, s.y) <= 1.0) {
-        // 1080p -> 4K / near-1:1: 4x4 Catmull-Rom + FidelityFX RCAS contrast recovery
-        let p = vuv * R - vec2f(0.5);
-        let fp = floor(p);
-        let f = p - fp;
-        let ip = vec2i(fp);
-        let mxc = vec2i(R) - vec2i(1);
-        let wcx = crW(f.x);
-        let wcy = crW(f.y);
-        var cr = vec3f(0.0);
-        var mn = vec3f(1e9);
-        var mxv = vec3f(-1e9);
-        for (var j = 0; j < 4; j = j + 1) {
-          for (var i = 0; i < 4; i = i + 1) {
-            let t = textureLoad(resTex, clamp(ip + vec2i(i - 1, j - 1), vec2i(0), mxc), 0).rgb;
-            cr = cr + t * (wcx[i] * wcy[j]);
-            if (i >= 1 && i <= 2 && j >= 1 && j <= 2) {
-              mn = min(mn, t);
-              mxv = max(mxv, t);
-            }
-          }
-        }
-        let base = clamp(cr, mn, mxv);
-        let n = textureSampleLevel(resTex, samp, vuv + vec2f(0.0, -invR.y), 0.0).rgb;
-        let sb = textureSampleLevel(resTex, samp, vuv + vec2f(0.0,  invR.y), 0.0).rgb;
-        let e = textureSampleLevel(resTex, samp, vuv + vec2f( invR.x, 0.0), 0.0).rgb;
-        let w = textureSampleLevel(resTex, samp, vuv + vec2f(-invR.x, 0.0), 0.0).rgb;
-        return rcasContrast(base, n, sb, e, w, sharp);
-      }
-      // Supersampled Minify (s in (1, 2], e.g. 1080p->3840x2160 downsampled to window):
-      // Lanczos-2 prefilter + RCAS 4K crispness
-      let h = 0.5 * max(s, vec2f(1.0));
-      let c = vuv * R;
-      let lw = vec4f(0.105, 0.395, 0.395, 0.105);
-      var acc = vec3f(0.0);
-      var mn = vec3f(1e9);
-      var mxv = vec3f(-1e9);
-      for (var j = 0; j < 4; j = j + 1) {
-        for (var i = 0; i < 4; i = i + 1) {
-          let pos = c + (vec2f(f32(i), f32(j)) - vec2f(1.5)) * h;
-          let t = textureSampleLevel(resTex, samp, pos / R, 0.0).rgb;
-          acc = acc + t * (lw[i] * lw[j]);
-          if (i >= 1 && i <= 2 && j >= 1 && j <= 2) {
-            mn = min(mn, t);
-            mxv = max(mxv, t);
-          }
-        }
-      }
-      let base = clamp(acc, mn, mxv);
+      // Near-1:1 or downsampled SR output: hardware bilinear + 4-neighbor RCAS (5 taps vs 20)
+      let base = textureSampleLevel(resTex, samp, vuv, 0.0).rgb;
       let n = textureSampleLevel(resTex, samp, vuv + vec2f(0.0, -stepR.y), 0.0).rgb;
       let sb = textureSampleLevel(resTex, samp, vuv + vec2f(0.0,  stepR.y), 0.0).rgb;
       let e = textureSampleLevel(resTex, samp, vuv + vec2f( stepR.x, 0.0), 0.0).rgb;
@@ -1212,21 +1165,24 @@
 
       const tsBegin = tsw ? tsw.begin : 0;
       const tsEnd = tsw ? tsw.end : 1;
-      const cp = encoder.beginComputePass(tsQS && tsBegin !== undefined
-        ? { timestampWrites: { querySet: tsQS, beginningOfPassWriteIndex: tsBegin } }
-        : undefined);
-      cp.setPipeline(core.pipes.analyze);
-      cp.setBindGroup(0, videoBG);
-      cp.setBindGroup(1, this.anaBG);
-      cp.dispatchWorkgroups(this.groupsW, this.groupsH);
-      cp.setPipeline(core.pipes.stats);
-      cp.setBindGroup(0, this.statsBG);
-      cp.dispatchWorkgroups(1);
-      cp.setPipeline(core.pipes.map);
-      cp.setBindGroup(0, this.mapBGs[cur]);
-      cp.dispatchWorkgroups(this.groupsW, this.groupsH);
-      cp.end();
-      encoder.copyBufferToBuffer(this.state, 0, this.sceneU, 0, 16);
+      const runHdrCompute = Boolean(p.hdr);
+      if (runHdrCompute) {
+        const cp = encoder.beginComputePass(tsQS && tsBegin !== undefined
+          ? { timestampWrites: { querySet: tsQS, beginningOfPassWriteIndex: tsBegin } }
+          : undefined);
+        cp.setPipeline(core.pipes.analyze);
+        cp.setBindGroup(0, videoBG);
+        cp.setBindGroup(1, this.anaBG);
+        cp.dispatchWorkgroups(this.groupsW, this.groupsH);
+        cp.setPipeline(core.pipes.stats);
+        cp.setBindGroup(0, this.statsBG);
+        cp.dispatchWorkgroups(1);
+        cp.setPipeline(core.pipes.map);
+        cp.setBindGroup(0, this.mapBGs[cur]);
+        cp.dispatchWorkgroups(this.groupsW, this.groupsH);
+        cp.end();
+        encoder.copyBufferToBuffer(this.state, 0, this.sceneU, 0, 16);
+      }
 
       let pipe = core.pipes.finalDirect;
       let srcView = core.dummyView;
@@ -1234,11 +1190,16 @@
       let resW = p.srcW;
       let resH = p.srcH;
       let srPasses = 0;
+      let wroteBegin = runHdrCompute;
       if (p.mode === 'sr' || p.mode === 'spatial') {
         this.ensureDecoded();
         const rp = encoder.beginRenderPass({
-          colorAttachments: [{ view: this.decView, loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }]
+          colorAttachments: [{ view: this.decView, loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
+          ...(!wroteBegin && tsQS && tsBegin !== undefined
+            ? { timestampWrites: { querySet: tsQS, beginningOfPassWriteIndex: tsBegin } }
+            : {})
         });
+        wroteBegin = true;
         rp.setPipeline(core.pipes.decode);
         rp.setBindGroup(0, videoBG);
         rp.draw(3);
@@ -1267,9 +1228,14 @@
       u[17] = resH;
       d.queue.writeBuffer(this.frameU, 0, u);
 
+      const fpTS = tsQS ? {
+        querySet: tsQS,
+        ...(!wroteBegin && tsBegin !== undefined ? { beginningOfPassWriteIndex: tsBegin } : {}),
+        ...(tsEnd !== undefined ? { endOfPassWriteIndex: tsEnd } : {})
+      } : null;
       const fp = encoder.beginRenderPass({
         colorAttachments: [{ view: targetView, loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
-        ...(tsQS && tsEnd !== undefined ? { timestampWrites: { querySet: tsQS, endOfPassWriteIndex: tsEnd } } : {})
+        ...(fpTS && Object.keys(fpTS).length ? { timestampWrites: fpTS } : {})
       });
       fp.setPipeline(pipe);
       fp.setBindGroup(0, videoBG);
@@ -1333,8 +1299,8 @@
   };
 
   const SR_TIERS = ['quality', 'fast', 'spatial'];
-  const SR_BUDGET_FRACTION = 0.78;   // of the video frame interval
-  const SR_BUDGET_STRIKES = 10;      // over-budget samples before stepping down
+  const SR_BUDGET_FRACTION = 0.45;   // keep GPU well below thermal/battery knee
+  const SR_BUDGET_STRIKES = 3;       // fast step-down before GPU queue backs up
 
   let settings = { ...DEFAULT_SETTINGS };
   let isEdrDisplay = window.matchMedia('(dynamic-range: high)').matches;
@@ -1377,7 +1343,7 @@
           gpuState.errorMsg = 'WebGPU is not available in this browser.';
           return null;
         }
-        const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+        const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'low-power' });
         if (!adapter) {
           gpuState.status = 'unsupported';
           gpuState.errorMsg = 'No WebGPU adapter found.';
@@ -1476,19 +1442,20 @@
       this.cachedBoxH = 0;
       this.lastLayoutCheckMs = 0;
 
-      this.isVisible = true;
+      this.isVisible = !document.hidden;
       this.isActive = false;
       this.nativeHdrDetected = false;
       this.blockedReason = null;
       this.rvfcId = null;
       this.frameSeed = 0;
       this.frameCounter = 0;
+      this.lastRenderedTime = -1;
+      this.dirtyRender = true;
       this.lastRectKey = '';
       this.configuredWidth = 0;
       this.configuredHeight = 0;
       this.lastReportedSig = '';
       this.lastRenderMs = 0;
-      this.lastStatusMs = 0;
       this.destroyed = false;
 
       // ML super-resolution state
@@ -1504,9 +1471,10 @@
       this.srFallback = null;
       this.srCfgKey = '';
 
-      // GPU timing / budget guard
+      // GPU timing / budget guard & queue backpressure
       this.gpuMs = null;
       this.gpuPending = false;
+      this.inFlightGpu = 0;
       this.overBudget = 0;
       this.frameIntervalMs = 1000 / 30;
       this.lastVfcNow = 0;
@@ -1524,8 +1492,10 @@
 
     setupObservers() {
       this.resizeObserver = new ResizeObserver(() => {
-        this.syncOverlayLayout(true);
-        this.scheduleRenderOnce();
+        if (this.syncOverlayLayout(true)) {
+          this.dirtyRender = true;
+          this.scheduleRenderOnce();
+        }
       });
       this.resizeObserver.observe(this.video);
       if (this.video.parentElement) {
@@ -1537,7 +1507,8 @@
           for (const entry of entries) {
             this.isVisible = entry.isIntersecting;
           }
-          if (this.isVisible) {
+          if (this.isVisible && !document.hidden) {
+            this.dirtyRender = true;
             this.scheduleLoop();
             this.scheduleRenderOnce();
           } else {
@@ -1612,6 +1583,7 @@
       this.renderer = null;
       this.gpuMs = null;
       this.gpuPending = false;
+      this.inFlightGpu = 0;
       this.resetStateNextFrame = true;
     }
 
@@ -1630,6 +1602,8 @@
       this.srDemoted = null;
       this.srBudgetNote = null;
       this.overBudget = 0;
+      this.gpuMs = null;
+      this.frameCounter = 0;
     }
 
     ensureCanvas() {
@@ -1816,6 +1790,7 @@
       }
 
       this.resetStateNextFrame = true;
+      this.dirtyRender = true;
       this.resetSRGuard();
       this.syncOverlayLayout(true);
       this.scheduleRenderOnce();
@@ -1823,7 +1798,7 @@
     }
 
     shouldRender() {
-      if (this.destroyed) return false;
+      if (this.destroyed || document.hidden) return false;
       const wantHdr = Boolean(settings.effectiveHdr) && !(settings.bypassNativeHdr && this.nativeHdrDetected);
       const wantUpscale = Boolean(settings.effectiveUpscale);
       if (!wantHdr && !wantUpscale) return false;
@@ -1864,37 +1839,22 @@
     }
 
     // Canvas backing size:
-    //  - upscaling: active whenever source is below 4K (3840x2160) or display exceeds source; targets
-    //    at least 4K supersampling (capped at 2x source / 3840x2160 / display pixels) so 720p/1080p/1440p
-    //    videos get real 4K detail even in theater/windowed Safari.
-    //  - HDR-only: content at min(source, display) pixels for low GPU power.
+    //  - never exceeds the actual physical display box (zero wasted supersampling bandwidth)
+    //  - upscaling (display content > 1.15x source): exact device pixels of the video box
+    //  - otherwise: content at min(source, display) pixels (1:1 texel-aligned when the display is
+    //    larger); the compositor scales the canvas up, so the GPU only shades source pixels.
     computeCanvasPlan(boxCssW, boxCssH, rect) {
-      const dpr = Math.min(window.devicePixelRatio || 1, 3);
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
       const maxDim = gpuState.device ? gpuState.device.limits.maxTextureDimension2D : 8192;
       const vw = Math.max(1, this.video.videoWidth);
       const vh = Math.max(1, this.video.videoHeight);
       const [ox, oy, rw, rh] = rect;
       const boxW = boxCssW * dpr;
       const boxH = boxCssH * dpr;
-      const below4k = vw < 3840 && vh < 2160;
       const upRatio = Math.max((boxW * rw) / vw, (boxH * rh) / vh);
-      const upscale = Boolean(settings.effectiveUpscale) && (upRatio > 1.05 || (below4k && upRatio > 0.75));
+      const upscale = Boolean(settings.effectiveUpscale) && upRatio > 1.15;
 
-      let targetW = boxW;
-      let targetH = boxH;
-      if (upscale && below4k) {
-        const capW = vw >= vh ? Math.min(3840, maxDim) : Math.min(2160, maxDim);
-        const capH = vw >= vh ? Math.min(2160, maxDim) : Math.min(3840, maxDim);
-        const curCW = boxW * Math.min(rw, 1.0);
-        const curCH = boxH * Math.min(rh, 1.0);
-        const desireW = Math.max(curCW, Math.min(capW, vw * 2));
-        const desireH = Math.max(curCH, Math.min(capH, vh * 2));
-        const boost = Math.max(desireW / Math.max(curCW, 1), desireH / Math.max(curCH, 1));
-        if (boost > 1.0) {
-          targetW *= boost;
-          targetH *= boost;
-        }
-      } else if (!upscale && upRatio > 1.0) {
+      if (!upscale && upRatio > 1.0) {
         let cw = Math.max(1, Math.round(vw / rw));
         let ch = Math.max(1, Math.round(vh / rh));
         if (cw <= maxDim && ch <= maxDim) {
@@ -1903,9 +1863,9 @@
           return { upscale, cw, ch, rectUniform: [offX / cw, offY / ch, vw / cw, vh / ch], outW: vw, outH: vh };
         }
       }
-      const k = Math.min(1, maxDim / Math.max(targetW, 1), maxDim / Math.max(targetH, 1));
-      const cw = Math.max(1, Math.round(targetW * k));
-      const ch = Math.max(1, Math.round(targetH * k));
+      const k = Math.min(1, maxDim / Math.max(boxW, 1), maxDim / Math.max(boxH, 1));
+      const cw = Math.max(1, Math.round(boxW * k));
+      const ch = Math.max(1, Math.round(boxH * k));
       return {
         upscale,
         cw,
@@ -1919,18 +1879,18 @@
     syncOverlayLayout(force = false) {
       if (!this.video.isConnected) {
         this.destroy();
-        return;
+        return false;
       }
       const now = performance.now();
-      if (!force && (now - this.lastLayoutCheckMs) < 250 && this.canvas && this.canvas.parentElement === this.video.parentElement && this.configuredWidth > 0) {
-        return;
+      if (!force && (now - this.lastLayoutCheckMs) < 1000 && this.canvas && this.canvas.parentElement === this.video.parentElement && this.configuredWidth > 0) {
+        return false;
       }
       this.lastLayoutCheckMs = now;
 
       if (!this.canvas) {
         this.ensureCanvas();
       }
-      if (!this.canvas) return;
+      if (!this.canvas) return false;
 
       if (this.video.parentElement && this.canvas.parentElement !== this.video.parentElement) {
         this.video.insertAdjacentElement('afterend', this.canvas);
@@ -1945,7 +1905,7 @@
           this.isActive = false;
           broadcastStatus();
         }
-        return;
+        return false;
       }
 
       const vRect = this.video.getBoundingClientRect();
@@ -1958,7 +1918,7 @@
           this.isActive = false;
           broadcastStatus();
         }
-        return;
+        return false;
       }
 
       const cb = this.canvas.offsetParent || document.documentElement;
@@ -1988,7 +1948,8 @@
       this.contentOutH = plan.outH;
 
       const rectKey = `${left.toFixed(1)},${top.toFixed(1)},${vRect.width.toFixed(1)},${vRect.height.toFixed(1)},${cw},${ch},${cs.zIndex},${cs.borderRadius},${Boolean(this.video.controls)}`;
-      if (rectKey !== this.lastRectKey) {
+      const rectChanged = rectKey !== this.lastRectKey;
+      if (rectChanged) {
         this.lastRectKey = rectKey;
         this.canvas.style.left = `${left}px`;
         this.canvas.style.top = `${top}px`;
@@ -2011,14 +1972,17 @@
       const upscalingChanged = this.upscalingActive !== plan.upscale;
       this.upscalingActive = plan.upscale;
 
+      let shownChanged = false;
       if (this.canvas.style.display !== 'block') {
         this.canvas.style.display = 'block';
+        shownChanged = true;
       }
       this.syncSplitHandle();
       if (!this.isActive || upscalingChanged) {
         this.isActive = true;
         broadcastStatus();
       }
+      return rectChanged || upscalingChanged || shownChanged;
     }
 
     // Decide ML SR vs spatial fallback for this frame; creates runtime instances lazily.
@@ -2040,17 +2004,9 @@
       const maxDim = gpuState.device.limits.maxTextureDimension2D;
       if (2 * vw > maxDim || 2 * vh > maxDim) return spatial('source too large for SR');
 
-      // Pass 1 produces 2x AI-restored video (e.g. 1080p -> 4K, 720p -> 1440p). For >2x output
-      // (720p -> 4K), only chain a second neural pass for low-res / Fast tier at <=30 fps; for Quality
-      // or 60 fps, directional EASU + RCAS in fsSR completes 1440p -> 4K cleanly in <0.5 ms without
-      // stalling or triggering budget demotion.
-      const ratio = Math.max(outW / vw, outH / vh);
-      let passes = 1;
-      if (ratio / 2 > 1.6 && 2 * vh <= 1440 && 4 * vw <= maxDim && 4 * vh <= maxDim) {
-        if ((tier === 'fast' && this.frameIntervalMs >= 28) || (2 * vw <= 1280 && 2 * vh <= 720)) {
-          passes = 2;
-        }
-      }
+      // Single 2x AI pass + EASU/RCAS spatial completion in fsSR (avoids 5x compute energy of
+      // chaining a second 2x SR pass on 4x pixels).
+      const passes = 1;
 
       const modelId = `tsr-${content}-${tier}`;
       const insts = this.ensureSRInstances(rt, modelId, passes);
@@ -2086,6 +2042,7 @@
               }
               this.srPending = null;
               this.srInsts.push(inst);
+              this.dirtyRender = true;
               this.scheduleRenderOnce();
               broadcastStatus();
             },
@@ -2131,6 +2088,11 @@
 
     renderFrame() {
       if (this.destroyed || gpuState.status !== 'ready' || !this.renderer) return;
+      const maxInFlight = this.upscalingActive ? 1 : 2;
+      if (this.inFlightGpu >= maxInFlight) {
+        this.dirtyRender = true;
+        return;
+      }
       this.syncOverlayLayout(false);
       if (!this.shouldRender() || !this.ctx || !this.canvas) return;
       if (this.cachedBoxW < 96 || this.cachedBoxH < 64) return;
@@ -2181,7 +2143,9 @@
       this.frameSeed = (this.frameSeed + 1) % 256;
       const reset = this.resetStateNextFrame;
       this.resetStateNextFrame = false;
-      const measure = this.gpuMs === null || this.frameCounter < 24 || this.overBudget > 0 || (this.frameCounter & 3) === 0;
+      this.dirtyRender = false;
+      const isSr = plan.mode === 'sr';
+      const measure = isSr && (this.gpuMs === null || this.frameCounter < 16 || this.overBudget > 0 || (this.frameCounter & 63) === 0);
       this.frameCounter++;
 
       const encoder = device.createCommandEncoder();
@@ -2220,21 +2184,31 @@
         return;
       }
       device.queue.submit([encoder.finish()]);
-
-      if (measure) {
-        const tsPromise = this.renderer.readTimestamps();
-        if (tsPromise) {
-          tsPromise.then((ms) => this.noteGpuTime(ms));
-        } else if (!this.gpuPending) {
-          this.gpuPending = true;
-          const t0 = performance.now();
-          device.queue.onSubmittedWorkDone().then(() => {
-            this.gpuPending = false;
-            this.noteGpuTime(performance.now() - t0);
-          }, () => {
-            this.gpuPending = false;
-          });
-        }
+      this.inFlightGpu++;
+      const tsPromise = measure ? this.renderer.readTimestamps() : null;
+      if (tsPromise) {
+        tsPromise.then((ms) => this.noteGpuTime(ms));
+        device.queue.onSubmittedWorkDone().then(
+          () => { this.inFlightGpu = Math.max(0, this.inFlightGpu - 1); },
+          () => { this.inFlightGpu = Math.max(0, this.inFlightGpu - 1); }
+        );
+      } else {
+        const measureWall = measure && !this.gpuPending;
+        if (measureWall) this.gpuPending = true;
+        const startMs = measureWall ? performance.now() : 0;
+        device.queue.onSubmittedWorkDone().then(
+          () => {
+            this.inFlightGpu = Math.max(0, this.inFlightGpu - 1);
+            if (measureWall) {
+              this.gpuPending = false;
+              this.noteGpuTime(performance.now() - startMs);
+            }
+          },
+          () => {
+            this.inFlightGpu = Math.max(0, this.inFlightGpu - 1);
+            if (measureWall) this.gpuPending = false;
+          }
+        );
       }
 
       const srModel = plan.mode === 'sr' ? plan.model : null;
@@ -2245,42 +2219,42 @@
         this.srModel = srModel;
         this.srFallback = srFallback;
         this.lastReportedSig = sig;
-        this.lastStatusMs = now;
-        broadcastStatus();
-      } else if (now - this.lastStatusMs > 2000) {
-        this.lastStatusMs = now;
         broadcastStatus();
       }
     }
 
     onVideoFrame(now) {
       this.rvfcId = null;
-      if (this.destroyed) return;
-      if (typeof now === 'number') {
-        if (this.lastVfcNow > 0) {
-          const d = now - this.lastVfcNow;
-          if (d > 4 && d < 150) this.frameIntervalMs = this.frameIntervalMs * 0.9 + d * 0.1;
+      if (this.destroyed || document.hidden || !this.isVisible) return;
+      const ct = this.video.currentTime;
+      // Avoid requestVideoFrameCallback in Safari/WebKit: startVideoFrameMetadataGathering
+      // forces sync GPU IPC + CPU CVPixelBuffer copies on every frame even when using
+      // zero-copy GPU importExternalTexture().
+      const sameFrame = ct === this.lastRenderedTime && !this.dirtyRender;
+      if (!sameFrame) {
+        if (typeof now === 'number') {
+          if (this.lastVfcNow > 0) {
+            const d = now - this.lastVfcNow;
+            if (d > 4 && d < 150) this.frameIntervalMs = this.frameIntervalMs * 0.9 + d * 0.1;
+          }
+          this.lastVfcNow = now;
         }
-        this.lastVfcNow = now;
+        this.lastRenderedTime = ct;
+        this.renderFrame();
       }
-      this.renderFrame();
-      if (!this.video.paused && !this.video.ended && this.isVisible && settings.effectiveEnabled) {
+      if (!this.video.paused && !this.video.ended && this.isVisible && !document.hidden && settings.effectiveEnabled) {
         this.scheduleLoop();
       }
     }
 
     scheduleLoop() {
       if (this.destroyed || this.rvfcId !== null) return;
-      if (!this.isVisible || !settings.effectiveEnabled) return;
-      if (typeof this.video.requestVideoFrameCallback === 'function') {
-        this.rvfcId = this.video.requestVideoFrameCallback(this.boundOnFrame);
-      } else {
-        this.rvfcId = requestAnimationFrame(this.boundOnFrame);
-      }
+      if (!this.isVisible || document.hidden || !settings.effectiveEnabled) return;
+      this.rvfcId = requestAnimationFrame(this.boundOnFrame);
     }
 
     scheduleRenderOnce() {
-      if (this.destroyed || this._oncePending) return;
+      if (this.destroyed || this._oncePending || document.hidden || !this.isVisible) return;
       this._oncePending = true;
       requestAnimationFrame(() => {
         this._oncePending = false;
@@ -2290,11 +2264,7 @@
 
     stopLoop() {
       if (this.rvfcId !== null) {
-        if (typeof this.video.cancelVideoFrameCallback === 'function') {
-          try { this.video.cancelVideoFrameCallback(this.rvfcId); } catch (_) {}
-        } else {
-          cancelAnimationFrame(this.rvfcId);
-        }
+        cancelAnimationFrame(this.rvfcId);
         this.rvfcId = null;
       }
     }
@@ -2483,11 +2453,28 @@
     }, 150);
   });
 
+  document.addEventListener('visibilitychange', () => {
+    for (const inst of instances.values()) {
+      if (document.hidden) {
+        inst.stopLoop();
+      } else if (inst.isVisible && settings.effectiveEnabled) {
+        inst.lastLayoutCheckMs = 0;
+        inst.dirtyRender = true;
+        inst.scheduleRenderOnce();
+        if (!inst.video.paused && !inst.video.ended) {
+          inst.scheduleLoop();
+        }
+      }
+    }
+  });
+
   for (const evt of ['fullscreenchange', 'webkitfullscreenchange', 'resize']) {
     document.addEventListener(evt, () => {
       for (const inst of instances.values()) {
-        inst.syncOverlayLayout(true);
-        inst.scheduleRenderOnce();
+        if (inst.syncOverlayLayout(true)) {
+          inst.dirtyRender = true;
+          inst.scheduleRenderOnce();
+        }
       }
     });
   }
@@ -2555,6 +2542,7 @@
       const needsLayout = srCfgChanged || prevEnabled !== settings.effectiveEnabled || prevHdr !== settings.effectiveHdr || prevUp !== settings.effectiveUpscale;
       for (const inst of instances.values()) {
         if (srCfgChanged) inst.resetSRGuard();
+        inst.dirtyRender = true;
         inst.syncOverlayLayout(needsLayout);
         inst.syncSplitHandle();
         if (settings.effectiveEnabled) {
