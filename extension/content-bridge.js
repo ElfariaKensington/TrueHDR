@@ -17,6 +17,7 @@
     upscaleContent: 'live',
     upscaleSharpness: 0.50,
     bypassNativeHdr: true,
+    imagesEnabled: false,
     splitEnabled: false,
     splitPos: 0.5,
     disabledSites: {},
@@ -56,8 +57,17 @@
       siteDisabled,
       effectiveHdr,
       effectiveUpscale,
-      effectiveEnabled: effectiveHdr || effectiveUpscale
+      effectiveEnabled: effectiveHdr || effectiveUpscale,
+      effectiveImages: effectiveHdr && Boolean(merged.imagesEnabled)
     };
+  }
+
+  function isDisplayedImageUrl(url) {
+    if (!/^https?:/i.test(url)) return false;
+    for (const img of document.images) {
+      if (img.currentSrc === url || img.src === url) return true;
+    }
+    return false;
   }
 
   function postToMain(kind, payload) {
@@ -117,6 +127,35 @@
       await updateStoredSettings((cur) => { cur.hdrEnabled = !cur.hdrEnabled; });
     } else if (data.kind === 'TOGGLE_UPSCALE') {
       await updateStoredSettings((cur) => { cur.upscaleEnabled = !cur.upscaleEnabled; });
+    } else if (data.kind === 'TOGGLE_IMAGES') {
+      await updateStoredSettings((cur) => { cur.imagesEnabled = !cur.imagesEnabled; });
+    } else if (data.kind === 'FETCH_IMAGE') {
+      // Cross-origin <img> without CORS headers: the engine cannot read its pixels, so the
+      // background fetches the bytes (no cookies). Only for URLs this page actually displays.
+      const id = data.payload && data.payload.id;
+      const url = data.payload && typeof data.payload.url === 'string' ? data.payload.url : '';
+      let resp = null;
+      if (url && isDisplayedImageUrl(url)) {
+        try {
+          resp = await ext.runtime.sendMessage({ type: 'TRUEHDR_FETCH_IMAGE', url });
+        } catch (err) {
+          resp = { ok: false, error: String(err) };
+        }
+      } else {
+        resp = { ok: false, error: 'not a displayed image' };
+      }
+      let blob = null;
+      if (resp && resp.ok && typeof resp.b64 === 'string') {
+        try {
+          const bin = atob(resp.b64);
+          const bytes = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+          blob = new Blob([bytes], { type: resp.mime || '' });
+        } catch (_) {
+          blob = null;
+        }
+      }
+      postToMain('IMAGE_DATA', { id, ok: Boolean(blob), error: blob ? null : (resp && resp.error) || 'fetch failed', blob });
     } else if (data.kind === 'TOGGLE_SPLIT') {
       await updateStoredSettings((cur) => { cur.splitEnabled = !cur.splitEnabled; });
     } else if (data.kind === 'SET_SPLIT_POS') {

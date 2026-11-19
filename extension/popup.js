@@ -15,6 +15,7 @@ const DEFAULT_SETTINGS = {
   upscaleContent: 'live',
   upscaleSharpness: 0.50,
   bypassNativeHdr: true,
+  imagesEnabled: false,
   splitEnabled: false,
   splitPos: 0.5,
   disabledSites: {},
@@ -144,6 +145,7 @@ function renderUI() {
   el('splitPosRow').classList.toggle('hidden', !settings.splitEnabled);
 
   el('bypassNativeHdr').checked = Boolean(settings.bypassNativeHdr);
+  el('imagesEnabled').checked = Boolean(settings.imagesEnabled);
 }
 
 function fmtRes(res) {
@@ -268,9 +270,20 @@ function renderStatus(status) {
     return;
   }
 
+  if (status.imageActiveCount > 0 && settings.hdrEnabled) {
+    const n = status.imageActiveCount;
+    const anim = status.imageAnimatedCount > 0 ? ` (${status.imageAnimatedCount} animated)` : '';
+    badge.classList.add(status.isEdrDisplay ? 'badge-edr' : 'badge-sdr');
+    badge.textContent = status.isEdrDisplay ? 'EDR Images' : 'SDR Display';
+    detail.textContent = `${n} image${n > 1 ? 's' : ''} in HDR${anim}`;
+    return;
+  }
+
   badge.classList.add('badge-idle');
   badge.textContent = status.isEdrDisplay ? 'EDR Ready' : 'Standby';
-  detail.textContent = status.videoCount > 0 ? 'Video paused or initializing…' : 'No active video on this page';
+  detail.textContent = status.videoCount > 0
+    ? 'Video paused or initializing…'
+    : (settings.imagesEnabled ? 'No video; no large images in view' : 'No active video on this page');
 }
 
 let saveTimer = null;
@@ -411,6 +424,14 @@ async function init() {
     settings.bypassNativeHdr = e.target.checked;
     saveSettings(true);
     setTimeout(refreshTabStatus, 140);
+  });
+
+  el('imagesEnabled').addEventListener('change', (e) => {
+    settings.imagesEnabled = e.target.checked;
+    if (settings.imagesEnabled) settings.hdrEnabled = true; // image HDR rides on the HDR switch
+    renderUI();
+    saveSettings(true);
+    setTimeout(refreshTabStatus, 300);
   });
 
   el('retryCorsBtn').addEventListener('click', async () => {

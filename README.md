@@ -23,6 +23,13 @@ Instead of applying SDR contrast/saturation CSS filters, **TrueHDR** intercepts 
 - `⌥H` (**Option + H**): Toggle HDR tone-mapping on/off
 - `⌥U` (**Option + U**): Toggle AI upscaling on/off
 - `⌥S` (**Option + S**): Toggle Split-Screen comparison (`SDR | EDR`)
+- `⌥I` (**Option + I**): Toggle HDR for images & GIFs
+
+## HDR for Images & GIFs (opt-in)
+Enable **HDR for images & GIFs** in the popup (or `⌥I`) to run the same EDR tone pipeline on `<img>` elements: photos, transparent PNGs, and animated GIF / APNG / WebP / AVIF (re-sampled at up to 30 fps).
+- Only images at least 96×64 CSS px that are on screen get an overlay. The 10 largest are processed, within a 16 MP GPU pixel budget, and at most 4 animate at once. Static images render once per layout or settings change.
+- Images that fade, transform, or are filtered show the original until they settle. `object-fit` / `object-position` and clipping by `overflow` ancestors are respected.
+- Cross-origin images are first re-requested with CORS. If the server refuses CORS, the background page fetches the image bytes without cookies, only for public http(s) hosts, only for `image/*` responses up to 24 MB, and only for URLs the page actually displays. Pixels that become readable this way are also readable by the page itself, which is why private hosts and credentials are excluded.
 
 ## Installing & Enabling in Safari
 1. Launch the signed app at `build/Build/Products/Release/TrueHDR.app` once (signed with `Apple Development: elfametesar@gmail.com (N77M7JPZ84)`, Team `RTFTQ673C9`).

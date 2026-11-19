@@ -654,6 +654,22 @@
       return shade(raw, vuv, fragPos);
     }
 
+    // ---- Image path (<img>, GIF frames): source is a pre-downscaled premultiplied-alpha copy
+    // at ~display resolution. Transparent areas stay transparent (premultiplied canvas).
+    @fragment
+    fn fsImage(@builtin(position) fragPos: vec4f, @location(0) uv: vec2f) -> @location(0) vec4f {
+      let vuv = contentUV(uv);
+      if (outside(vuv)) { return vec4f(0.0); }
+      if (onDivider(uv)) { return vec4f(1.8, 1.8, 1.8, 1.0); }
+      let s = textureSampleBaseClampToEdge(vidTex, samp, vuv);
+      let a = clamp(s.a, 0.0, 1.0);
+      if (a < 0.002) { return vec4f(0.0); }
+      let raw = s.rgb / a;
+      var c: vec4f;
+      if (leftOfSplit(uv)) { c = sdrOut(raw); } else { c = shade(raw, vuv, fragPos); }
+      return vec4f(c.rgb * a, a);
+    }
+
     // ---- ML path: resample the 2x/4x SR result to the exact device-pixel content rect --------
     fn crW(f: f32) -> vec4f {
       return vec4f(
@@ -901,14 +917,16 @@
       (pipe) => ({ pipe, variant: 'sampled' }),
       () => compute('analyzeLoad', 'csAnalyze', anaLayout).then((pipe) => ({ pipe, variant: 'load' }))
     );
-    const [ana, stats, map, decode, finalDirect, finalSR, finalSpatial] = await Promise.all([
+    const [ana, stats, map, decode, finalDirect, finalSR, finalSpatial, finalImage] = await Promise.all([
       analyzePipe,
       compute('stats', 'csStats', PL([statsBGL])),
       compute('map', 'csMap', PL([mapBGL])),
       render('decode', 'fsDecode', PL([videoBGL])),
       render('final', 'fsDirect', finalLayout),
       render('final', 'fsSR', finalLayout),
-      render('final', 'fsSpatial', finalLayout)
+      render('final', 'fsSpatial', finalLayout),
+      // Image overlays only exist on the texture_2d core; skip the extra compile on the video core
+      test2D ? render('final', 'fsImage', finalLayout) : Promise.resolve(null)
     ]);
 
     const sampler = device.createSampler({
@@ -932,7 +950,7 @@
       dummyView: dummyTex.createView(),
       analyzeVariant: ana.variant,
       layouts: { videoBGL, anaBGL, statsBGL, mapBGL, finalBGL },
-      pipes: { analyze: ana.pipe, stats, map, decode, finalDirect, finalSR, finalSpatial }
+      pipes: { analyze: ana.pipe, stats, map, decode, finalDirect, finalSR, finalSpatial, finalImage }
     };
   }
 
@@ -1184,7 +1202,7 @@
         encoder.copyBufferToBuffer(this.state, 0, this.sceneU, 0, 16);
       }
 
-      let pipe = core.pipes.finalDirect;
+      let pipe = p.mode === 'image' && core.pipes.finalImage ? core.pipes.finalImage : core.pipes.finalDirect;
       let srcView = core.dummyView;
       let resView = core.dummyView;
       let resW = p.srcW;
@@ -1291,11 +1309,13 @@
     upscaleContent: 'live',    // 'live' | 'anime'
     upscaleSharpness: 0.50,    // 0.0 .. 1.0
     bypassNativeHdr: true,
+    imagesEnabled: false,      // also HDR-ify <img> (photos, GIFs, animated WebP/PNG)
     splitEnabled: false,
     splitPos: 0.5,
     effectiveHdr: true,
     effectiveUpscale: true,
-    effectiveEnabled: true
+    effectiveEnabled: true,
+    effectiveImages: false
   };
 
   const SR_TIERS = ['quality', 'fast', 'spatial'];
@@ -1370,6 +1390,13 @@
           for (const inst of instances.values()) {
             inst.onDeviceLost();
           }
+          imageCore = { device: null, promise: null };
+          for (const p of images.values()) {
+            p.deactivate();
+            p.core = null;
+            p.ctx = null; // a context configured for the lost device is not reusable
+          }
+          scheduleImagePump();
         });
 
         const core = await createCore(device);
@@ -1388,15 +1415,16 @@
     return gpuState.initPromise;
   }
 
+  // video === null: page-level toast (pages without a playing video, e.g. image HDR toggle)
   function showHudToast(video, text) {
-    const host = video.parentElement;
+    const host = video ? video.parentElement : document.body || document.documentElement;
     if (!host) return;
     let toast = host.querySelector(':scope > [data-truehdr-toast="1"]');
     if (!toast) {
       toast = document.createElement('div');
       toast.setAttribute('data-truehdr-toast', '1');
       Object.assign(toast.style, {
-        position: 'absolute',
+        position: video ? 'absolute' : 'fixed',
         top: '14px',
         right: '14px',
         zIndex: '2147483640',
@@ -2323,6 +2351,837 @@
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Images & GIFs (opt-in: settings.imagesEnabled). Each eligible on-screen <img> gets an EDR
+  // overlay canvas fed through the same analysis + tone pipeline as video (texture_2d core).
+  // Static images render once per layout/settings change; animated GIF/APNG/WebP/AVIF are
+  // re-sampled at up to 30 fps. GPU memory is bounded by a count + pixel budget.
+  // ---------------------------------------------------------------------------
+
+  const IMG_MIN_CSS_W = 96;
+  const IMG_MIN_CSS_H = 64;
+  const IMG_MIN_NATURAL = 48;
+  const IMG_MAX_ACTIVE = 10;
+  const IMG_MAX_ANIMATED = 4;
+  const IMG_PIXEL_BUDGET = 16e6;        // sum of active overlay canvas pixels
+  const IMG_MAX_CANVAS_PIXELS = 4.2e6;  // per overlay; larger displays are compositor-upscaled
+  const IMG_MAX_SOURCE_PIXELS = 8.4e6;
+  const IMG_ANIM_INTERVAL_MS = 1000 / 30;
+  const IMG_SNIFF_BYTES = 256 * 1024;
+  const IMG_STATIC_EXT = /\.(jpe?g|jfif|bmp|ico|svg|heic|heif)(?:[?#]|$)/i;
+  const IMG_ANIM_HINT = /(\.(gif|webp|apng)(?:[?#]|$))|^data:image\/(gif|webp|apng)/i;
+
+  const images = new Map();            // HTMLImageElement -> ImageHDRProcessor
+  const imgSourceCache = new Map();    // url -> Promise<{ kind: 'cors' } | { kind: 'blob', blob } | null>
+  const imgAnimCache = new Map();      // url -> Promise<boolean>
+  const imgFetchPending = new Map();   // request id -> resolve
+  let imgFetchSeq = 0;
+  let imageCore = { device: null, promise: null };
+
+  function getImageCore() {
+    return ensureGPU().then((gpu) => {
+      if (!gpu) return null;
+      if (imageCore.device !== gpu.device || !imageCore.promise) {
+        imageCore.device = gpu.device;
+        imageCore.promise = createCore(gpu.device, { texture2DSource: true }).catch((err) => {
+          console.warn('[TrueHDR] image pipeline init failed:', err);
+          imageCore.promise = null;
+          return null;
+        });
+      }
+      return imageCore.promise;
+    });
+  }
+
+  function lruSet(map, key, value, max) {
+    map.set(key, value);
+    if (map.size > max) map.delete(map.keys().next().value);
+    return value;
+  }
+
+  // Animated container detection from the leading bytes (no full decode).
+  function sniffAnimated(b) {
+    const n = b.length;
+    const str = (o, len) => (o + len <= n ? String.fromCharCode.apply(null, b.subarray(o, o + len)) : '');
+    if (str(0, 4) === 'GIF8' && n >= 13) {
+      let p = 13;
+      if (b[10] & 0x80) p += 3 * (1 << ((b[10] & 7) + 1));
+      let frames = 0;
+      while (p < n) {
+        const t = b[p];
+        if (t === 0x2c) {
+          if (++frames > 1) return true;
+          if (p + 10 > n) break;
+          const packed = b[p + 9];
+          p += 10;
+          if (packed & 0x80) p += 3 * (1 << ((packed & 7) + 1));
+          p += 1; // LZW minimum code size
+          while (p < n && b[p] !== 0) p += b[p] + 1;
+          p += 1;
+        } else if (t === 0x21) {
+          if (b[p + 1] === 0xff && b[p + 2] === 11) {
+            const app = str(p + 3, 11);
+            if (app === 'NETSCAPE2.0' || app === 'ANIMEXTS1.0') return true;
+          }
+          p += 2;
+          while (p < n && b[p] !== 0) p += b[p] + 1;
+          p += 1;
+        } else {
+          break;
+        }
+      }
+      return false;
+    }
+    if (b[0] === 0x89 && str(1, 3) === 'PNG') {
+      let p = 8;
+      while (p + 8 <= n) {
+        const len = ((b[p] << 24) | (b[p + 1] << 16) | (b[p + 2] << 8) | b[p + 3]) >>> 0;
+        const type = str(p + 4, 4);
+        if (type === 'acTL') return true;
+        if (type === 'IDAT' || type === 'IEND') return false;
+        p += 12 + len;
+      }
+      return false;
+    }
+    if (str(0, 4) === 'RIFF' && str(8, 4) === 'WEBP') {
+      return str(12, 4) === 'VP8X' && n > 20 && (b[20] & 0x02) !== 0;
+    }
+    if (str(4, 4) === 'ftyp') {
+      const size = Math.min(n, ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) >>> 0);
+      for (let p = 8; p + 4 <= size; p += 4) {
+        if (str(p, 4) === 'avis') return true;
+      }
+    }
+    return false;
+  }
+
+  async function readUrlPrefix(url, limit) {
+    const resp = await fetch(url, { cache: 'force-cache' });
+    if (!resp.ok || !resp.body) return null;
+    const reader = resp.body.getReader();
+    const chunks = [];
+    let total = 0;
+    while (total < limit) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      total += value.length;
+    }
+    try { reader.cancel(); } catch (_) {}
+    const out = new Uint8Array(Math.min(total, limit));
+    let o = 0;
+    for (const c of chunks) {
+      const take = Math.min(c.length, out.length - o);
+      out.set(c.subarray(0, take), o);
+      o += take;
+      if (o >= out.length) break;
+    }
+    return out;
+  }
+
+  function detectAnimated(url, blob) {
+    if (!url || IMG_STATIC_EXT.test(url)) return Promise.resolve(false);
+    let p = imgAnimCache.get(url);
+    if (!p) {
+      p = (async () => {
+        const bytes = blob
+          ? new Uint8Array(await blob.slice(0, IMG_SNIFF_BYTES).arrayBuffer())
+          : await readUrlPrefix(url, IMG_SNIFF_BYTES);
+        return bytes ? sniffAnimated(bytes) : IMG_ANIM_HINT.test(url);
+      })().catch(() => IMG_ANIM_HINT.test(url));
+      lruSet(imgAnimCache, url, p, 256);
+    }
+    return p;
+  }
+
+  function loadImageElement(src, cors) {
+    return new Promise((resolve, reject) => {
+      const im = new Image();
+      if (cors) im.crossOrigin = 'anonymous';
+      im.decoding = 'async';
+      im.onload = () => resolve(im);
+      im.onerror = () => reject(new Error('image load failed'));
+      im.src = src;
+    });
+  }
+
+  function canReadPixels(im) {
+    try {
+      const c = document.createElement('canvas');
+      c.width = 1;
+      c.height = 1;
+      const g = c.getContext('2d');
+      g.drawImage(im, 0, 0, 1, 1);
+      g.getImageData(0, 0, 1, 1);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function fetchImageViaExtension(url) {
+    return new Promise((resolve) => {
+      const id = ++imgFetchSeq;
+      const timer = setTimeout(() => {
+        imgFetchPending.delete(id);
+        resolve(null);
+      }, 20000);
+      imgFetchPending.set(id, (payload) => {
+        clearTimeout(timer);
+        resolve(payload && payload.ok && payload.blob instanceof Blob ? payload.blob : null);
+      });
+      postToBridge('FETCH_IMAGE', { id, url });
+    });
+  }
+
+  // Pixel-readable source for a cross-origin <img>: first a CORS re-request (standard web
+  // security, works on most CDNs), then the extension's cookie-less fetch.
+  function resolveTaintedSource(url) {
+    let p = imgSourceCache.get(url);
+    if (!p) {
+      p = (async () => {
+        if (/^https?:/i.test(url)) {
+          try {
+            const im = await loadImageElement(url, true);
+            if (canReadPixels(im)) return { kind: 'cors' };
+          } catch (_) {}
+          const blob = await fetchImageViaExtension(url);
+          if (blob) return { kind: 'blob', blob };
+        }
+        return null;
+      })();
+      lruSet(imgSourceCache, url, p, 48);
+    }
+    return p;
+  }
+
+  function parsePosToken(tok, boxLen, contentLen) {
+    const kw = { left: 0, top: 0, center: 0.5, right: 1, bottom: 1 };
+    if (tok in kw) return (boxLen - contentLen) * kw[tok];
+    if (tok.endsWith('%')) return (boxLen - contentLen) * (parseFloat(tok) / 100);
+    if (tok.endsWith('px')) return parseFloat(tok);
+    return (boxLen - contentLen) * 0.5;
+  }
+
+  // Content rect of the image inside its CSS box, normalized (ox, oy, w, h); w/h > 1 = cropped.
+  function imageContentRect(boxW, boxH, nw, nh, fit, position) {
+    if (!fit || fit === 'fill' || boxW <= 0 || boxH <= 0) return [0, 0, 1, 1];
+    const ar = nw / nh;
+    const containW = boxW / boxH > ar ? boxH * ar : boxW;
+    const containH = containW / ar;
+    let cw;
+    let ch;
+    if (fit === 'cover') {
+      cw = boxW / boxH > ar ? boxW : boxH * ar;
+      ch = cw / ar;
+    } else if (fit === 'none') {
+      cw = nw;
+      ch = nh;
+    } else if (fit === 'scale-down' && nw <= containW) {
+      cw = nw;
+      ch = nh;
+    } else {
+      cw = containW;
+      ch = containH;
+    }
+    const toks = String(position || '50% 50%').trim().split(/\s+/);
+    let px = toks[0] || 'center';
+    let py = toks[1] || 'center';
+    if (toks.length === 1 && (px === 'top' || px === 'bottom')) { py = px; px = 'center'; }
+    if (px === 'top' || px === 'bottom' || py === 'left' || py === 'right') { const t = px; px = py; py = t; }
+    const ox = toks.length <= 2 ? parsePosToken(px, boxW, cw) : (boxW - cw) * 0.5;
+    const oy = toks.length <= 2 ? parsePosToken(py, boxH, ch) : (boxH - ch) * 0.5;
+    return [ox / boxW, oy / boxH, cw / boxW, ch / boxH];
+  }
+
+  class ImageHDRProcessor {
+    constructor(img) {
+      this.img = img;
+      this.canvas = null;
+      this.ctx = null;
+      this.renderer = null;
+      this.core = null;
+      this.srcTex = null;
+      this.srcView = null;
+      this.srcW = 0;
+      this.srcH = 0;
+      this.scratch = null;
+      this.scratch2d = null;
+      this.proxy = null;
+      this.proxyUrl = null;
+      this.sourceBlob = null;
+      this.sourceKey = '';
+      this.sourceState = 'none'; // 'none' | 'direct' | 'resolving' | 'proxy' | 'blocked'
+      this.sourceToken = 0;
+      this.forceProxy = false;
+      this.animated = false;
+      this.inView = false;
+      this.active = false;
+      this.plan = null;
+      this.lastKey = '';
+      this.configuredW = 0;
+      this.configuredH = 0;
+      this.lastRenderMs = 0;
+      this.frameSeed = 0;
+      this.needReset = true;
+      this.inFlight = 0;
+      this.renderQueued = false;
+      this.gen = 0;
+      this.destroyed = false;
+
+      this.onLoad = () => {
+        this.resetSource();
+        if (this.active) this.prepare();
+        else scheduleImagePump();
+      };
+      img.addEventListener('load', this.onLoad);
+      this.io = new IntersectionObserver((entries) => {
+        for (const e of entries) this.inView = e.isIntersecting;
+        scheduleImagePump();
+      }, { rootMargin: '200px 0px', threshold: 0 });
+      this.io.observe(img);
+      this.ro = new ResizeObserver(() => this.requestRender());
+      this.ro.observe(img);
+    }
+
+    resetSource() {
+      this.sourceToken++;
+      this.dropProxy();
+      this.sourceKey = '';
+      this.sourceState = 'none';
+      this.sourceBlob = null;
+      this.forceProxy = false;
+      this.animated = false;
+      this.needReset = true;
+      this.lastKey = '';
+    }
+
+    dropProxy() {
+      if (this.proxy && this.proxy.parentElement) this.proxy.remove();
+      this.proxy = null;
+      if (this.proxyUrl) {
+        try { URL.revokeObjectURL(this.proxyUrl); } catch (_) {}
+        this.proxyUrl = null;
+      }
+    }
+
+    // On-screen area when this image should get an overlay right now, else 0.
+    eligibleArea() {
+      const img = this.img;
+      if (this.destroyed || !img.isConnected || this.sourceState === 'blocked') return 0;
+      if (!img.complete || img.naturalWidth < IMG_MIN_NATURAL || img.naturalHeight < IMG_MIN_NATURAL) return 0;
+      const r = img.getBoundingClientRect();
+      if (r.width < IMG_MIN_CSS_W || r.height < IMG_MIN_CSS_H) return 0;
+      const cs = getComputedStyle(img);
+      // Fades, hidden carousel slides and hover zooms act on the <img> itself and would not
+      // apply to the sibling overlay: show the original until it settles.
+      if (cs.visibility !== 'visible' || parseFloat(cs.opacity) < 0.99 || cs.transform !== 'none' || cs.display === 'none') return 0;
+      if (cs.filter && cs.filter !== 'none') return 0;
+      return r.width * r.height;
+    }
+
+    plannedPixels() {
+      const r = this.img.getBoundingClientRect();
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      return Math.min(IMG_MAX_CANVAS_PIXELS, r.width * r.height * dpr * dpr);
+    }
+
+    ensureCanvas() {
+      if (this.canvas) return;
+      const canvas = document.createElement('canvas');
+      canvas.setAttribute('data-truehdr', 'img');
+      canvas.setAttribute('aria-hidden', 'true');
+      canvas.tabIndex = -1;
+      canvas.inert = true;
+      Object.assign(canvas.style, { position: 'absolute', margin: '0', padding: '0', border: '0', background: 'transparent', display: 'none' });
+      canvas.style.setProperty('pointer-events', 'none', 'important');
+      canvas.style.setProperty('user-select', 'none', 'important');
+      canvas.style.setProperty('-webkit-user-select', 'none', 'important');
+      this.canvas = canvas;
+      this.ctx = null;
+      this.configuredW = 0;
+      this.configuredH = 0;
+    }
+
+    anchor() {
+      const parent = this.img.parentElement;
+      return parent && parent.tagName === 'PICTURE' ? parent : this.img;
+    }
+
+    configure() {
+      if (!this.ctx && this.canvas) this.ctx = this.canvas.getContext('webgpu');
+      if (!this.ctx || !this.core) return;
+      try {
+        this.ctx.configure({
+          device: this.core.device,
+          format: 'rgba16float',
+          colorSpace: 'display-p3',
+          toneMapping: { mode: 'extended' },
+          alphaMode: 'premultiplied'
+        });
+      } catch (err) {
+        console.warn('[TrueHDR] Image context configure failed:', err);
+      }
+    }
+
+    activate() {
+      if (this.active || this.destroyed) return;
+      this.active = true;
+      this.gen++;
+      this.ensureCanvas();
+      this.needReset = true;
+      this.prepare();
+    }
+
+    deactivate() {
+      if (!this.active) return;
+      this.active = false;
+      this.gen++;
+      if (this.canvas) this.canvas.style.display = 'none';
+      if (this.ctx) {
+        try { this.ctx.unconfigure(); } catch (_) {}
+      }
+      this.configuredW = 0;
+      this.configuredH = 0;
+      this.lastKey = '';
+      if (this.proxy && this.proxy.parentElement) this.proxy.remove();
+      this.releaseGpu();
+      if (this.scratch) {
+        this.scratch.width = 0;
+        this.scratch.height = 0;
+        this.scratch2d = null;
+      }
+    }
+
+    releaseGpu() {
+      if (this.renderer) {
+        try { this.renderer.destroy(); } catch (_) {}
+      }
+      this.renderer = null;
+      if (this.srcTex) {
+        try { this.srcTex.destroy(); } catch (_) {}
+      }
+      this.srcTex = null;
+      this.srcView = null;
+      this.srcW = 0;
+      this.srcH = 0;
+      this.inFlight = 0;
+    }
+
+    async prepare() {
+      const gen = this.gen;
+      const core = await getImageCore();
+      if (!core || gen !== this.gen || !this.active) return;
+      if (this.core !== core) {
+        this.releaseGpu();
+        this.core = core;
+        if (this.ctx) {
+          try { this.ctx.unconfigure(); } catch (_) {}
+        }
+        this.configuredW = 0;
+        this.configuredH = 0;
+      }
+      if (!this.renderer) this.renderer = new FrameRenderer(core);
+      const ok = await this.ensureSource();
+      if (!ok || gen !== this.gen || !this.active) return;
+      this.lastKey = '';
+      this.renderNow();
+      const url = this.sourceKey;
+      const animated = await detectAnimated(url, this.sourceBlob);
+      if (gen !== this.gen || !this.active || url !== this.sourceKey) return;
+      this.animated = animated;
+      if (animated) {
+        this.mountProxy();
+        startImageAnimation();
+      }
+    }
+
+    async ensureSource() {
+      const img = this.img;
+      const url = img.currentSrc || img.src || '';
+      if (!url) return false;
+      if (this.sourceKey === url) {
+        if (this.sourceState === 'direct' || this.sourceState === 'proxy') return true;
+        if (this.sourceState === 'blocked') return false;
+      }
+      const token = ++this.sourceToken;
+      this.dropProxy();
+      this.sourceKey = url;
+      this.sourceBlob = null;
+      if (!this.forceProxy && canReadPixels(img)) {
+        this.sourceState = 'direct';
+        return true;
+      }
+      this.sourceState = 'resolving';
+      const res = await resolveTaintedSource(url);
+      if (token !== this.sourceToken || this.destroyed) return false;
+      if (!res) {
+        this.sourceState = 'blocked';
+        scheduleImagePump();
+        return false;
+      }
+      let proxy = null;
+      let proxyUrl = null;
+      try {
+        if (res.kind === 'cors') {
+          proxy = await loadImageElement(url, true);
+        } else {
+          proxyUrl = URL.createObjectURL(res.blob);
+          proxy = await loadImageElement(proxyUrl, false);
+        }
+      } catch (_) {
+        proxy = null;
+      }
+      if (token !== this.sourceToken || this.destroyed) {
+        if (proxyUrl) URL.revokeObjectURL(proxyUrl);
+        return false;
+      }
+      if (!proxy) {
+        if (proxyUrl) URL.revokeObjectURL(proxyUrl);
+        this.sourceState = 'blocked';
+        scheduleImagePump();
+        return false;
+      }
+      this.proxy = proxy;
+      this.proxyUrl = proxyUrl;
+      this.sourceBlob = res.kind === 'blob' ? res.blob : null;
+      this.sourceState = 'proxy';
+      return true;
+    }
+
+    // WebKit only advances GIF/APNG animation for images in the render tree, so an animated
+    // proxy sits (invisibly) under the overlay.
+    mountProxy() {
+      const px = this.proxy;
+      if (!px || !this.canvas || !this.canvas.parentElement) return;
+      if (px.parentElement !== this.canvas.parentElement || px.nextSibling !== this.canvas) {
+        px.setAttribute('data-truehdr', 'proxy');
+        px.setAttribute('aria-hidden', 'true');
+        px.alt = '';
+        Object.assign(px.style, { position: 'absolute', margin: '0', padding: '0', border: '0', opacity: '0.01' });
+        px.style.setProperty('pointer-events', 'none', 'important');
+        this.canvas.insertAdjacentElement('beforebegin', px);
+      }
+      for (const k of ['left', 'top', 'width', 'height', 'zIndex']) px.style[k] = this.canvas.style[k];
+    }
+
+    // Overlay geometry; returns false when the overlay must stay hidden.
+    syncLayout() {
+      const img = this.img;
+      const canvas = this.canvas;
+      const anchor = this.anchor();
+      if (!anchor.parentElement) return false;
+      if (canvas.parentElement !== anchor.parentElement) {
+        anchor.insertAdjacentElement('afterend', canvas);
+        if (this.animated) this.mountProxy();
+      }
+      const r = img.getBoundingClientRect();
+      if (r.width < IMG_MIN_CSS_W || r.height < IMG_MIN_CSS_H) return false;
+      const cb = canvas.offsetParent || document.documentElement;
+      let left;
+      let top;
+      if (cb === document.documentElement || cb === document.body) {
+        left = r.left + window.scrollX;
+        top = r.top + window.scrollY;
+      } else {
+        const cbRect = cb.getBoundingClientRect();
+        left = r.left - cbRect.left - cb.clientLeft + cb.scrollLeft;
+        top = r.top - cbRect.top - cb.clientTop + cb.scrollTop;
+      }
+      // Ancestors between the image and the overlay's containing block may clip the image
+      // (overflow) but would not clip an absolutely positioned overlay: replicate as clip-path.
+      let cl = r.left;
+      let ct = r.top;
+      let cr = r.right;
+      let cbt = r.bottom;
+      for (let el = img.parentElement; el && el !== cb && el !== document.body && el !== document.documentElement; el = el.parentElement) {
+        const s = getComputedStyle(el);
+        if (s.overflowX !== 'visible' || s.overflowY !== 'visible') {
+          const er = el.getBoundingClientRect();
+          cl = Math.max(cl, er.left);
+          ct = Math.max(ct, er.top);
+          cr = Math.min(cr, er.right);
+          cbt = Math.min(cbt, er.bottom);
+        }
+      }
+      if (cr - cl < 4 || cbt - ct < 4) return false;
+      const clip = [ct - r.top, r.right - cr, r.bottom - cbt, cl - r.left].map((v) => Math.max(0, v));
+      const clipCss = clip.some((v) => v > 0.5) ? `inset(${clip.map((v) => `${v.toFixed(1)}px`).join(' ')})` : '';
+
+      const cs = getComputedStyle(img);
+      const nw = img.naturalWidth;
+      const nh = img.naturalHeight;
+      const rect = imageContentRect(r.width, r.height, nw, nh, cs.objectFit, cs.objectPosition);
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const maxDim = this.core.device.limits.maxTextureDimension2D;
+      let cw = r.width * dpr;
+      let ch = r.height * dpr;
+      const k = Math.min(1, Math.sqrt(IMG_MAX_CANVAS_PIXELS / Math.max(cw * ch, 1)), maxDim / cw, maxDim / ch);
+      cw = Math.max(1, Math.round(cw * k));
+      ch = Math.max(1, Math.round(ch * k));
+      const outW = Math.max(1, Math.round(cw * rect[2]));
+      const outH = Math.max(1, Math.round(ch * rect[3]));
+      const ks = Math.min(1, nw / outW, nh / outH, Math.sqrt(IMG_MAX_SOURCE_PIXELS / (outW * outH)), maxDim / outW, maxDim / outH);
+      const sw = Math.max(1, Math.round(outW * ks));
+      const sh = Math.max(1, Math.round(outH * ks));
+      this.plan = { rect, outW, outH, sw, sh };
+
+      const key = `${left.toFixed(1)},${top.toFixed(1)},${r.width.toFixed(1)},${r.height.toFixed(1)},${cw},${ch},${cs.zIndex},${cs.borderRadius},${clipCss},${rect.join(',')}`;
+      if (key !== this.lastKey) {
+        this.lastKey = key;
+        Object.assign(canvas.style, {
+          left: `${left}px`,
+          top: `${top}px`,
+          width: `${r.width}px`,
+          height: `${r.height}px`,
+          zIndex: cs.zIndex,
+          borderRadius: cs.borderRadius,
+          clipPath: clipCss
+        });
+        if (canvas.width !== cw || canvas.height !== ch || this.configuredW === 0) {
+          canvas.width = cw;
+          canvas.height = ch;
+          this.configuredW = cw;
+          this.configuredH = ch;
+          this.configure();
+        }
+        if (this.animated) this.mountProxy();
+      }
+      return true;
+    }
+
+    uploadSource(device) {
+      const { sw, sh } = this.plan;
+      const src = this.proxy || this.img;
+      if (!this.scratch) this.scratch = document.createElement('canvas');
+      if (this.scratch.width !== sw || this.scratch.height !== sh || !this.scratch2d) {
+        this.scratch.width = sw;
+        this.scratch.height = sh;
+        this.scratch2d = this.scratch.getContext('2d');
+      }
+      const g = this.scratch2d;
+      g.clearRect(0, 0, sw, sh);
+      g.imageSmoothingEnabled = true;
+      g.imageSmoothingQuality = 'high';
+      g.drawImage(src, 0, 0, sw, sh);
+      if (!this.srcTex || this.srcW !== sw || this.srcH !== sh) {
+        if (this.srcTex) {
+          try { this.srcTex.destroy(); } catch (_) {}
+        }
+        this.srcTex = device.createTexture({
+          size: [sw, sh, 1],
+          format: 'rgba8unorm',
+          usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT
+        });
+        this.srcView = this.srcTex.createView();
+        this.srcW = sw;
+        this.srcH = sh;
+        this.needReset = true;
+      }
+      device.queue.copyExternalImageToTexture({ source: this.scratch }, { texture: this.srcTex, premultipliedAlpha: true }, [sw, sh]);
+    }
+
+    requestRender() {
+      if (!this.active) {
+        scheduleImagePump();
+        return;
+      }
+      if (this.renderQueued) return;
+      this.renderQueued = true;
+      requestAnimationFrame(() => {
+        this.renderQueued = false;
+        this.renderNow();
+      });
+    }
+
+    renderNow() {
+      if (!this.active || this.destroyed || !this.renderer || !this.core || !this.canvas) return;
+      if (this.sourceState !== 'direct' && this.sourceState !== 'proxy') return;
+      if (this.inFlight >= 2) return;
+      if (this.eligibleArea() <= 0 || !this.syncLayout()) {
+        this.canvas.style.display = 'none';
+        return;
+      }
+      const device = this.core.device;
+      try {
+        this.uploadSource(device);
+      } catch (err) {
+        if (err && err.name === 'SecurityError' && !this.forceProxy) {
+          this.forceProxy = true;
+          this.sourceKey = '';
+          this.sourceState = 'none';
+          this.prepare();
+        }
+        return;
+      }
+      if (!this.ctx) this.configure();
+      let swapTex;
+      try {
+        swapTex = this.ctx.getCurrentTexture();
+      } catch (_) {
+        this.configure();
+        try { swapTex = this.ctx.getCurrentTexture(); } catch (e2) { return; }
+      }
+      const now = performance.now();
+      const dt = this.lastRenderMs > 0 ? (now - this.lastRenderMs) / 1000 : 1 / 30;
+      this.lastRenderMs = now;
+      this.frameSeed = (this.frameSeed + 1) % 256;
+      const p = this.plan;
+      const encoder = device.createCommandEncoder();
+      try {
+        this.renderer.encode(encoder, this.srcView, swapTex.createView(), {
+          srcW: this.srcW,
+          srcH: this.srcH,
+          rect: p.rect,
+          outW: p.outW,
+          outH: p.outH,
+          tone: [settings.peakBoost, settings.threshold, settings.localPunch, settings.gamutBoost],
+          shadowDepth: settings.shadowDepth,
+          aplGuard: settings.aplGuard,
+          splitPos: settings.splitEnabled ? settings.splitPos : -1.0,
+          hdr: true,
+          bypassNativeHdr: false,
+          sharpDirect: false,
+          sharpness: 0,
+          mode: 'image',
+          // Static images: every render is a fresh scene. Animations keep temporal smoothing.
+          reset: this.needReset || !this.animated,
+          dt,
+          frameSeed: this.frameSeed
+        });
+      } catch (err) {
+        console.warn('[TrueHDR] Image encode failed:', err);
+        return;
+      }
+      this.needReset = false;
+      device.queue.submit([encoder.finish()]);
+      this.inFlight++;
+      const done = () => { this.inFlight = Math.max(0, this.inFlight - 1); };
+      device.queue.onSubmittedWorkDone().then(done, done);
+      if (this.canvas.style.display !== 'block') this.canvas.style.display = 'block';
+    }
+
+    destroy() {
+      if (this.destroyed) return;
+      this.deactivate();
+      this.destroyed = true;
+      this.io.disconnect();
+      this.ro.disconnect();
+      this.img.removeEventListener('load', this.onLoad);
+      this.dropProxy();
+      if (this.canvas && this.canvas.parentElement) this.canvas.remove();
+      this.canvas = null;
+      this.ctx = null;
+      images.delete(this.img);
+    }
+  }
+
+  let imgPumpQueued = false;
+  function scheduleImagePump() {
+    if (imgPumpQueued) return;
+    imgPumpQueued = true;
+    requestAnimationFrame(() => {
+      imgPumpQueued = false;
+      pumpImages();
+    });
+  }
+
+  // Decide which images get overlays: largest visible first, within count + pixel budgets.
+  function pumpImages() {
+    const enabled = Boolean(settings.effectiveImages) && !document.hidden;
+    const cands = [];
+    for (const p of Array.from(images.values())) {
+      if (!p.img.isConnected) {
+        p.destroy();
+        continue;
+      }
+      const area = enabled && p.inView ? p.eligibleArea() : 0;
+      if (area > 0) cands.push([area, p]);
+      else p.deactivate();
+    }
+    cands.sort((a, b) => b[0] - a[0]);
+    let budget = IMG_PIXEL_BUDGET;
+    let n = 0;
+    for (const [, p] of cands) {
+      const px = p.plannedPixels();
+      if (n < IMG_MAX_ACTIVE && px <= budget) {
+        budget -= px;
+        n++;
+        if (p.active) p.requestRender();
+        else p.activate();
+      } else {
+        p.deactivate();
+      }
+    }
+    updateImageTicker();
+    startImageAnimation();
+    broadcastStatus();
+  }
+
+  // Static overlays are re-checked once a second for layout shifts the observers miss.
+  let imgTicker = null;
+  function updateImageTicker() {
+    let any = false;
+    for (const p of images.values()) if (p.active) { any = true; break; }
+    if (any && !imgTicker) {
+      imgTicker = setInterval(() => {
+        if (document.hidden) return;
+        for (const p of images.values()) {
+          if (!p.active) continue;
+          if (!p.img.isConnected || p.eligibleArea() <= 0) {
+            scheduleImagePump();
+            continue;
+          }
+          const before = p.lastKey;
+          if (p.canvas && p.syncLayout() && p.lastKey !== before && !p.animated) p.renderNow();
+        }
+      }, 1000);
+    } else if (!any && imgTicker) {
+      clearInterval(imgTicker);
+      imgTicker = null;
+    }
+  }
+
+  let imgAnimRaf = null;
+  function startImageAnimation() {
+    if (imgAnimRaf !== null || document.hidden) return;
+    for (const p of images.values()) {
+      if (p.active && p.animated) {
+        imgAnimRaf = requestAnimationFrame(imageAnimationTick);
+        return;
+      }
+    }
+  }
+
+  function imageAnimationTick(now) {
+    imgAnimRaf = null;
+    if (document.hidden) return;
+    const anim = [];
+    for (const p of images.values()) if (p.active && p.animated) anim.push(p);
+    if (anim.length === 0) return;
+    anim.sort((a, b) => b.plannedPixels() - a.plannedPixels());
+    for (const p of anim.slice(0, IMG_MAX_ANIMATED)) {
+      if (now - p.lastRenderMs >= IMG_ANIM_INTERVAL_MS - 2) p.renderNow();
+    }
+    imgAnimRaf = requestAnimationFrame(imageAnimationTick);
+  }
+
+  function attachImage(img) {
+    if (!(img instanceof HTMLImageElement) || images.has(img) || img.hasAttribute('data-truehdr')) return;
+    images.set(img, new ImageHDRProcessor(img));
+  }
+
+  function scanImages(root = document) {
+    if (!settings.effectiveImages || !root || !root.querySelectorAll) return;
+    for (const img of root.querySelectorAll('img')) attachImage(img);
+    scheduleImagePump();
+  }
+
+  function destroyAllImages() {
+    for (const p of Array.from(images.values())) p.destroy();
+    updateImageTicker();
+  }
+
   function attachVideo(video) {
     if (!video || !(video instanceof HTMLVideoElement)) return;
     if (instances.has(video)) return;
@@ -2374,6 +3233,14 @@
         if (inst.nativeHdrDetected && settings.bypassNativeHdr) bypassedNativeHdr = true;
         if (!blockedReason && inst.blockedReason) blockedReason = inst.blockedReason;
       }
+      let imageActiveCount = 0;
+      let imageAnimatedCount = 0;
+      for (const p of images.values()) {
+        if (p.active) {
+          imageActiveCount++;
+          if (p.animated) imageAnimatedCount++;
+        }
+      }
 
       postToBridge('STATUS', {
         host: location.hostname || '',
@@ -2393,7 +3260,10 @@
         srModel,
         srPasses,
         srFallback,
-        gpuMs
+        gpuMs,
+        effectiveImages: Boolean(settings.effectiveImages),
+        imageActiveCount,
+        imageAnimatedCount
       });
     }, 80);
   }
@@ -2407,7 +3277,16 @@
         } else if (node instanceof Element && (node.tagName === 'VIDEO' || node.querySelector('video'))) {
           scanVideos(node);
         }
+        if (settings.effectiveImages) {
+          if (node instanceof HTMLImageElement) {
+            attachImage(node);
+            scheduleImagePump();
+          } else if (node instanceof Element && node.getAttribute('data-truehdr') === null && node.querySelector('img')) {
+            scanImages(node);
+          }
+        }
       }
+      if (m.removedNodes.length && images.size) scheduleImagePump();
       for (const node of m.removedNodes) {
         if (node instanceof HTMLVideoElement && instances.has(node)) {
           instances.get(node).destroy();
@@ -2454,6 +3333,7 @@
   });
 
   document.addEventListener('visibilitychange', () => {
+    if (images.size) scheduleImagePump();
     for (const inst of instances.values()) {
       if (document.hidden) {
         inst.stopLoop();
@@ -2470,6 +3350,7 @@
 
   for (const evt of ['fullscreenchange', 'webkitfullscreenchange', 'resize']) {
     document.addEventListener(evt, () => {
+      if (images.size) scheduleImagePump();
       for (const inst of instances.values()) {
         if (inst.syncOverlayLayout(true)) {
           inst.dirtyRender = true;
@@ -2483,7 +3364,8 @@
     KeyM: ['TOGGLE_MASTER', () => `TrueHDR: ${!settings.enabled ? 'ON' : 'OFF'}`],
     KeyH: ['TOGGLE_HDR', () => (!settings.hdrEnabled ? `HDR: ON (${settings.peakBoost.toFixed(1)}x EDR)` : 'HDR: OFF')],
     KeyU: ['TOGGLE_UPSCALE', () => `Upscaling: ${!settings.upscaleEnabled ? 'ON' : 'OFF'}`],
-    KeyS: ['TOGGLE_SPLIT', () => `Split View: ${!settings.splitEnabled ? 'SDR | EDR' : 'OFF'}`]
+    KeyS: ['TOGGLE_SPLIT', () => `Split View: ${!settings.splitEnabled ? 'SDR | EDR' : 'OFF'}`],
+    KeyI: ['TOGGLE_IMAGES', () => `Image HDR: ${!settings.imagesEnabled ? 'ON' : 'OFF'}`]
   };
 
   window.addEventListener(
@@ -2497,12 +3379,15 @@
       e.preventDefault();
       postToBridge(entry[0], {});
       const msg = entry[1]();
+      let shown = false;
       for (const inst of instances.values()) {
         if (inst.video.videoWidth > 0) {
           showHudToast(inst.video, msg);
+          shown = true;
           break;
         }
       }
+      if (!shown && window.top === window) showHudToast(null, msg);
     },
     true
   );
@@ -2537,7 +3422,18 @@
       if (!data.payload || typeof data.payload.effectiveEnabled !== 'boolean') {
         incoming.effectiveEnabled = Boolean(incoming.effectiveHdr || incoming.effectiveUpscale);
       }
+      if (!data.payload || typeof data.payload.effectiveImages !== 'boolean') {
+        incoming.effectiveImages = Boolean(incoming.effectiveHdr && incoming.imagesEnabled);
+      }
+      const prevImages = Boolean(settings.effectiveImages);
       settings = incoming;
+      if (settings.effectiveImages && !prevImages) {
+        scanImages(document);
+      } else if (!settings.effectiveImages && prevImages) {
+        destroyAllImages();
+      } else if (settings.effectiveImages) {
+        for (const p of images.values()) p.requestRender();
+      }
       const srCfgChanged = prevSrCfg !== `${settings.upscaleQuality}|${settings.upscaleContent}`;
       const needsLayout = srCfgChanged || prevEnabled !== settings.effectiveEnabled || prevHdr !== settings.effectiveHdr || prevUp !== settings.effectiveUpscale;
       for (const inst of instances.values()) {
@@ -2558,6 +3454,13 @@
         }
       }
       broadcastStatus();
+    } else if (data.kind === 'IMAGE_DATA') {
+      const payload = data.payload || {};
+      const resolve = imgFetchPending.get(payload.id);
+      if (resolve) {
+        imgFetchPending.delete(payload.id);
+        resolve(payload);
+      }
     } else if (data.kind === 'RETRY_CORS') {
       for (const inst of instances.values()) {
         if (inst.blockedReason && inst.blockedReason.includes('CORS')) {

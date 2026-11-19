@@ -15,6 +15,7 @@ const DEFAULT_SETTINGS = {
   upscaleContent: 'live',
   upscaleSharpness: 0.50,
   bypassNativeHdr: true,
+  imagesEnabled: false,
   splitEnabled: false,
   splitPos: 0.5,
   disabledSites: {},
@@ -116,6 +117,13 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
 
+  if (message.type === 'TRUEHDR_FETCH_IMAGE' && sender.tab && sender.tab.id >= 0) {
+    fetchImageBytes(String(message.url || ''))
+      .then((r) => sendResponse({ ok: true, ...r }))
+      .catch((err) => sendResponse({ ok: false, error: String(err && err.message ? err.message : err) }));
+    return true;
+  }
+
   if (message.type === 'TRUEHDR_GET_TAB_STATUS') {
     const state = tabStates.get(message.tabId) || null;
     sendResponse({ state });
@@ -124,6 +132,51 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   return false;
 });
+
+// Image bytes for cross-origin <img> elements that lack CORS headers (HDR-for-images option).
+// The page can read whatever this returns, so it must never act as a credentialed or
+// intranet proxy: no cookies, public http(s) hosts only, image/* responses only, size-capped.
+const IMAGE_FETCH_MAX_BYTES = 24 * 1024 * 1024;
+
+function isPrivateHost(host) {
+  const h = host.toLowerCase().replace(/^\[|\]$/g, '');
+  if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.internal')) return true;
+  if (!h.includes('.') && !h.includes(':')) return true; // single-label intranet names
+  const v4 = h.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (v4) {
+    const [a, b] = [Number(v4[1]), Number(v4[2])];
+    return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127);
+  }
+  if (h.includes(':')) {
+    return h === '::1' || h === '::' || h.startsWith('fc') || h.startsWith('fd') || h.startsWith('fe80') || h.startsWith('::ffff:');
+  }
+  return false;
+}
+
+function bytesToBase64(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(s);
+}
+
+async function fetchImageBytes(url) {
+  const u = new URL(url);
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') throw new Error('unsupported scheme');
+  if (isPrivateHost(u.hostname)) throw new Error('private host');
+  const resp = await fetch(u.href, { credentials: 'omit', cache: 'force-cache', redirect: 'follow', referrerPolicy: 'no-referrer' });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  if (resp.url && isPrivateHost(new URL(resp.url).hostname)) throw new Error('private host');
+  const mime = (resp.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+  if (!mime.startsWith('image/')) throw new Error(`not an image (${mime || 'unknown'})`);
+  const declared = Number(resp.headers.get('content-length') || 0);
+  if (declared > IMAGE_FETCH_MAX_BYTES) throw new Error('image too large');
+  const buf = new Uint8Array(await resp.arrayBuffer());
+  if (buf.length > IMAGE_FETCH_MAX_BYTES) throw new Error('image too large');
+  return { mime, b64: bytesToBase64(buf) };
+}
 
 ext.tabs.onRemoved.addListener((tabId) => {
   tabStates.delete(tabId);
@@ -134,7 +187,7 @@ async function updateBadge(tabId, status) {
   try {
     let text = '';
     let color = '#1e293b';
-    if (status && status.activeCount > 0) {
+    if (status && (status.activeCount > 0 || status.imageActiveCount > 0)) {
       if (status.effectiveHdr && !status.bypassedNativeHdr) {
         text = status.upscalingActive ? 'H+SR' : (status.isEdrDisplay ? 'HDR' : 'ON');
         color = status.isEdrDisplay ? '#f59e0b' : '#3b82f6';
