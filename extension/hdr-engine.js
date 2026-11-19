@@ -33,11 +33,10 @@
       return select(hi, lo, c <= vec3f(0.04045));
     }
 
-    // Decoded R'G'B' -> linear light. Pixels already above SDR white (native PQ/HLG decoded to
-    // extended range) are treated as linear.
+    // Decoded R'G'B' -> linear light (continuous sRGB transfer, NaN/Inf sanitized).
     fn decodeLinear(raw: vec3f) -> vec3f {
-      let r = max(raw, vec3f(0.0));
-      return select(srgbToLinear(r), r, max(r.r, max(r.g, r.b)) > 1.02);
+      let safe = select(vec3f(0.0), raw, (raw >= vec3f(0.0)) & (raw <= vec3f(64.0)));
+      return srgbToLinear(safe);
     }
 
     fn luma709(c: vec3f) -> f32 {
@@ -147,12 +146,13 @@
         for (var i = 0; i < 16; i = i + 1) {
           let o = vec2f(f32(i % 4), f32(i / 4)) * 2.0;
           let pq = vec2i(gid.xy) * 8 + vec2i(o);
-          let raw = max(${tap}, vec3f(0.0));
+          let raw0 = ${tap};
+          let raw = select(vec3f(0.0), raw0, (raw0 >= vec3f(0.0)) & (raw0 <= vec3f(64.0)));
           let mx = max(raw.r, max(raw.g, raw.b));
           let lin = decodeLinear(raw);
           let Y = luma709(lin);
           sumY = sumY + Y;
-          hdr = hdr + select(0.0, 1.0, mx > 1.03);
+          hdr = hdr + select(0.0, 1.0, mx > 1.05);
           q[i] = log2(max(mix(Y, max(lin.r, max(lin.g, lin.b)), 0.46), 1.0 / 16384.0));
           pv[i] = mix(luma709(raw), mx, 0.46);
         }
@@ -326,7 +326,7 @@
     }
 
     fn rw(m: f32, med: f32) -> f32 {
-      let d = (m - med) / 0.6;
+      let d = (m - med) / 0.40;
       return exp(-d * d);
     }
 
@@ -361,24 +361,14 @@
       let bsum = (rw(m0, med) * m0 + rw(m2, med) * m2 + rw(m6, med) * m6 + rw(m8, med) * m8) * 0.5
                + (rw(m1, med) * m1 + rw(m3, med) * m3 + rw(m5, med) * m5 + rw(m7, med) * m7) * 0.7
                + w4 * m4;
-      let B = bsum / max(wc + we + w4, 1e-6);
+      // Use the brighter of the range-weighted median and 4-neighbor max so dark objects/text
+      // never drag down the background reference and create white halos on adjacent light pixels.
+      let cardHi = max(max(m1, m3), max(m5, m7));
+      let B = max(bsum / max(wc + we + w4, 1e-6), mix(med, cardHi, 0.75));
 
-      // Caption / UI text: dense strong edges spread over a 56x24 px window (7x3 cells).
-      // An isolated speck or bird only lights one or two cells and stays far below threshold.
-      var dens = 0.0;
-      for (var dy = -1; dy <= 1; dy = dy + 1) {
-        for (var dx = -3; dx <= 3; dx = dx + 1) {
-          dens = dens + tD[tc + dy * 14 + dx];
-        }
-      }
-      let text = smoothstep(0.035, 0.09, dens / 21.0);
-
-      let prev = textureLoad(prevMap, c, 0);
-      let reset = st.cut > 0.5;
-      let aT = select(u.stat.w, u.stat.z, text > prev.y);
-      let outB = select(mix(prev.x, B, u.stat.z), B, reset);
-      let outT = select(mix(prev.y, text, aT), text, reset);
-      textureStore(mapOut, c, vec4f(outB, outT, 0.0, 1.0));
+      // Instant spatial background (zero temporal ghosting behind moving objects) and no
+      // coarse 56x24 box gain-clamping (prevents grey halo/box corruption around fonts).
+      textureStore(mapOut, c, vec4f(B, 0.0, 0.0, 1.0));
     }
   `;
 
@@ -440,10 +430,11 @@
       let g = textureGather(0, mapTex, samp, muv);
       let f = fract(muv * vec2f(textureDimensions(mapTex)) - vec2f(0.5));
       let bw = vec4f((1.0 - f.x) * f.y, f.x * f.y, f.x * (1.0 - f.y), (1.0 - f.x) * (1.0 - f.y));
-      // Range weight: cells within ~1.8 stops of the pixel; pixels far from all four (highlights)
-      // fall back to plain bilinear through the epsilon.
+      // Range weight: reject darker cells strongly so small dark silhouettes (birds) never
+      // pull down the local background estimate of surrounding sky pixels.
       let d = vec4f(L) - g;
-      let x = max(vec4f(1.0) - 0.3 * d * d, vec4f(0.0));
+      let k = select(vec4f(0.85), vec4f(1.35), d > vec4f(0.0));
+      let x = max(vec4f(1.0) - k * d * d, vec4f(0.0));
       let w = bw * (x * x + vec4f(1e-4));
       let B = dot(w, g) / max(dot(w, vec4f(1.0)), 1e-6);
       let t = textureSampleLevel(mapTex, samp, muv, 0.0).y;
@@ -463,22 +454,22 @@
       let bg = exp2(loc.x);
       let detail = max(0.0, E - bg * 1.15);
       // Text protection only for pixels well above their background inside text-dense regions
-      let textProt = clamp(loc.y, 0.0, 1.0) * smoothstep(0.08, 0.30, detail);
+      let textProt = clamp(loc.y, 0.0, 1.0) * smoothstep(0.10, 0.32, detail);
 
-      // Deep-black-only shadow floor (< 0.015 linear)
+      // Deep-black-only shadow floor (< 0.015 linear), kept gentle to avoid dark silhouette crush
       var shadowRatio = 1.0;
       if (maxIn < 0.015) {
-        let blackToe = pow(max(maxIn, 1e-5), u.extra.x * 0.35);
+        let blackToe = pow(max(maxIn, 1e-5), u.extra.x * 0.25);
         let blackMix = 1.0 - smoothstep(0.002, 0.015, maxIn);
-        shadowRatio = mix(1.0, clamp(blackToe, 0.78, 1.0), blackMix);
+        shadowRatio = mix(1.0, clamp(blackToe, 0.86, 1.0), blackMix);
       }
 
       // EDR highlight curve above the knee (white-screen guarded peak) from the LUT
       var hdrGain = lut.x;
 
-      // Local specular punch: brightness above the robust local background
-      let localMask = smoothstep(0.02, 0.24, detail) * lut.y * (1.0 - textProt * 0.85);
-      hdrGain = hdrGain * (1.0 + u.tone.z * 0.90 * localMask);
+      // Local specular punch: only genuine bright local highlights above background
+      let localMask = smoothstep(0.08, 0.32, detail) * lut.y * (1.0 - textProt * 0.85);
+      hdrGain = hdrGain * (1.0 + u.tone.z * 0.50 * localMask);
 
       hdrGain = mix(hdrGain, min(hdrGain, scene.v.w), textProt * 0.85);
 
@@ -497,11 +488,16 @@
 
     fn shade(raw: vec3f, vuv: vec2f, fragPos: vec4f) -> vec4f {
       let flags = u32(u.extra.w + 0.5);
-      let maxRaw = max(raw.r, max(raw.g, raw.b));
-      if ((flags & 1u) == 0u || ((flags & 2u) != 0u && (scene.v.y > 0.02 || maxRaw > 1.03))) {
+      if ((flags & 1u) == 0u) {
         return sdrOut(raw);
       }
-      return toneMapHDR(decodeLinear(raw), vuv, fragPos);
+      let hdrCol = toneMapHDR(decodeLinear(raw), vuv, fragPos);
+      // Frame-level smooth bypass for native HDR streams; never cut per-pixel holes at 1.03!
+      if ((flags & 2u) != 0u && scene.v.y > 0.002) {
+        let nativeW = smoothstep(0.002, 0.015, scene.v.y);
+        return mix(hdrCol, sdrOut(raw), nativeW);
+      }
+      return hdrCol;
     }
 
     fn contentUV(uv: vec2f) -> vec2f {
@@ -520,7 +516,113 @@
       return u.extra.z >= 0.0 && uv.x < u.extra.z;
     }
 
-    // ---- HDR-only path: canvas content at min(source, display) resolution -------------------
+    // ---- HDR-only path: native/minification + optional RCAS clarity for native 4K+ ------------
+    fn rcasTapRes(ip: vec2i, mxc: vec2i) -> vec3f {
+      return textureLoad(resTex, clamp(ip, vec2i(0), mxc), 0).rgb;
+    }
+
+    fn rcasContrast(c: vec3f, n: vec3f, s: vec3f, e: vec3f, w: vec3f, sharp: f32) -> vec3f {
+      if (sharp <= 0.001) { return c; }
+      let sh = clamp(sharp, 0.0, 1.0);
+      let mn = min(min(n, s), min(e, w));
+      let mx = max(max(n, s), max(e, w));
+      let mn5 = min(mn, c);
+      let mx5 = max(mx, c);
+      let hitMin = mn5 / max(4.0 * mx + vec3f(1e-4), vec3f(1e-4));
+      let hitMax = (vec3f(1.0) - mx5) / max(4.0 * (vec3f(1.0) - mn) + vec3f(1e-4), vec3f(1e-4));
+      let lobeV = min(hitMin, hitMax);
+      let lobe = clamp(min(lobeV.r, min(lobeV.g, lobeV.b)), 0.0, 0.22);
+      let peak = mix(0.08, 0.20, sh);
+      let w0 = -min(lobe, peak) * sh;
+      let sharpCol = (c + (n + s + e + w) * w0) / max(1.0 + 4.0 * w0, 1e-4);
+      let ringTol = max(mx5 - mn5, vec3f(0.0)) * (0.06 * sh);
+      return clamp(sharpCol, mn5 - ringTol, mx5 + ringTol);
+    }
+
+    fn easuSRTap(
+      cSum: ptr<function, vec3f>,
+      wSum: ptr<function, f32>,
+      off: vec2f,
+      dir: vec2f,
+      len: vec2f,
+      lob: f32,
+      col: vec3f
+    ) {
+      let v = vec2f(dot(off, dir), dot(off, vec2f(-dir.y, dir.x))) * len;
+      let d2 = min(dot(v, v), 4.0);
+      let wB = 0.4 * d2 - 1.0;
+      let wA = lob * d2 - 1.0;
+      let w = (1.5625 * wB * wB - 0.5625) * (wA * wA);
+      *cSum = *cSum + col * w;
+      *wSum = *wSum + w;
+    }
+
+    fn easuSR(vuv: vec2f, fdims: vec2f) -> vec3f {
+      let mxc = vec2i(fdims) - vec2i(1);
+      let p = vuv * fdims - vec2f(0.5);
+      let fp = floor(p);
+      let f = p - fp;
+      let ip = vec2i(fp);
+
+      let b  = rcasTapRes(ip + vec2i( 0, -1), mxc);
+      let c  = rcasTapRes(ip + vec2i( 1, -1), mxc);
+      let e  = rcasTapRes(ip + vec2i(-1,  0), mxc);
+      let f0 = rcasTapRes(ip + vec2i( 0,  0), mxc);
+      let f1 = rcasTapRes(ip + vec2i( 1,  0), mxc);
+      let h  = rcasTapRes(ip + vec2i( 2,  0), mxc);
+      let i  = rcasTapRes(ip + vec2i(-1,  1), mxc);
+      let j  = rcasTapRes(ip + vec2i( 0,  1), mxc);
+      let k  = rcasTapRes(ip + vec2i( 1,  1), mxc);
+      let l  = rcasTapRes(ip + vec2i( 2,  1), mxc);
+      let n  = rcasTapRes(ip + vec2i( 0,  2), mxc);
+      let o  = rcasTapRes(ip + vec2i( 1,  2), mxc);
+
+      let lb = luma709(b); let lc = luma709(c);
+      let le = luma709(e); let lf0 = luma709(f0); let lf1 = luma709(f1); let lh = luma709(h);
+      let li = luma709(i); let lj = luma709(j);   let lk = luma709(k);   let ll = luma709(l);
+      let ln = luma709(n); let lo = luma709(o);
+
+      let g0 = vec2f(lf1 - le, lj - lb);
+      let g1 = vec2f(lh - lf0, lk - lc);
+      let g2 = vec2f(lk - li, ln - lf0);
+      let g3 = vec2f(ll - lj, lo - lf1);
+
+      let w0 = (1.0 - f.x) * (1.0 - f.y);
+      let w1 = f.x * (1.0 - f.y);
+      let w2 = (1.0 - f.x) * f.y;
+      let w3 = f.x * f.y;
+
+      let grad = g0 * w0 + g1 * w1 + g2 * w2 + g3 * w3;
+      let gLenSq = dot(grad, grad);
+      let hasEdge = gLenSq > 1e-5;
+      let normG = select(vec2f(1.0, 0.0), grad * inverseSqrt(max(gLenSq, 1e-5)), hasEdge);
+      let dir = vec2f(-normG.y, normG.x);
+
+      let edgeStrength = clamp(sqrt(gLenSq) * 2.4, 0.0, 1.0);
+      let stretch = 1.0 + edgeStrength * 0.85;
+      let len = vec2f(1.0 / stretch, 1.0 + edgeStrength * 0.40);
+      let lob = mix(0.24, 0.36, edgeStrength);
+
+      var cSum = vec3f(0.0);
+      var wSum: f32 = 0.0;
+      easuSRTap(&cSum, &wSum, vec2f( 0.0, -1.0) - f, dir, len, lob, b);
+      easuSRTap(&cSum, &wSum, vec2f( 1.0, -1.0) - f, dir, len, lob, c);
+      easuSRTap(&cSum, &wSum, vec2f(-1.0,  0.0) - f, dir, len, lob, e);
+      easuSRTap(&cSum, &wSum, vec2f( 0.0,  0.0) - f, dir, len, lob, f0);
+      easuSRTap(&cSum, &wSum, vec2f( 1.0,  0.0) - f, dir, len, lob, f1);
+      easuSRTap(&cSum, &wSum, vec2f( 2.0,  0.0) - f, dir, len, lob, h);
+      easuSRTap(&cSum, &wSum, vec2f(-1.0,  1.0) - f, dir, len, lob, i);
+      easuSRTap(&cSum, &wSum, vec2f( 0.0,  1.0) - f, dir, len, lob, j);
+      easuSRTap(&cSum, &wSum, vec2f( 1.0,  1.0) - f, dir, len, lob, k);
+      easuSRTap(&cSum, &wSum, vec2f( 2.0,  1.0) - f, dir, len, lob, l);
+      easuSRTap(&cSum, &wSum, vec2f( 0.0,  2.0) - f, dir, len, lob, n);
+      easuSRTap(&cSum, &wSum, vec2f( 1.0,  2.0) - f, dir, len, lob, o);
+
+      let min4 = min(min(f0, f1), min(j, k));
+      let max4 = max(max(f0, f1), max(j, k));
+      return clamp(cSum / max(wSum, 1e-4), min4, max4);
+    }
+
     @fragment
     fn fsDirect(@builtin(position) fragPos: vec4f, @location(0) uv: vec2f) -> @location(0) vec4f {
       let vuv = contentUV(uv);
@@ -537,6 +639,16 @@
                     + textureSampleBaseClampToEdge(vidTex, samp, vuv + vec2f( o.x,  o.y)).rgb);
       } else {
         raw = textureSampleBaseClampToEdge(vidTex, samp, vuv).rgb;
+        let flags = u32(u.extra.w + 0.5);
+        let sharp = clamp(u.res.z, 0.0, 1.0);
+        if ((flags & 4u) != 0u && sharp > 0.01) {
+          let t = 1.0 / max(u.info.xy, vec2f(1.0));
+          let rn = textureSampleBaseClampToEdge(vidTex, samp, vuv + vec2f(0.0, -t.y)).rgb;
+          let rs = textureSampleBaseClampToEdge(vidTex, samp, vuv + vec2f(0.0,  t.y)).rgb;
+          let re = textureSampleBaseClampToEdge(vidTex, samp, vuv + vec2f( t.x, 0.0)).rgb;
+          let rw = textureSampleBaseClampToEdge(vidTex, samp, vuv + vec2f(-t.x, 0.0)).rgb;
+          raw = rcasContrast(raw, rn, rs, re, rw, sharp * 0.65);
+        }
       }
       if (leftOfSplit(uv)) { return sdrOut(raw); }
       return shade(raw, vuv, fragPos);
@@ -552,18 +664,24 @@
       );
     }
 
-    fn bsW(f: f32) -> vec4f {
-      let g = 1.0 - f;
-      return vec4f(g * g * g, 4.0 - 6.0 * f * f + 3.0 * f * f * f, 1.0 + 3.0 * f + 3.0 * f * f - 3.0 * f * f * f, f * f * f) / 6.0;
-    }
-
     fn resampleSR(vuv: vec2f) -> vec3f {
       let R = u.res.xy;
       let s = R / max(u.outp.xy, vec2f(1.0));
       let sharp = clamp(u.res.z, 0.0, 1.0);
+      let invR = 1.0 / max(R, vec2f(1.0));
+      let stepR = clamp(s, vec2f(0.5), vec2f(1.35)) * invR;
+      if (max(s.x, s.y) < 0.85) {
+        // Large post-SR magnification (e.g. 720p -> 1440p AI SR -> 4K display):
+        // directional 12-tap EASU contour reconstruction + RCAS 4K detail pop.
+        let base = easuSR(vuv, R);
+        let n = textureSampleLevel(resTex, samp, vuv + vec2f(0.0, -stepR.y), 0.0).rgb;
+        let sb = textureSampleLevel(resTex, samp, vuv + vec2f(0.0,  stepR.y), 0.0).rgb;
+        let e = textureSampleLevel(resTex, samp, vuv + vec2f( stepR.x, 0.0), 0.0).rgb;
+        let w = textureSampleLevel(resTex, samp, vuv + vec2f(-stepR.x, 0.0), 0.0).rgb;
+        return rcasContrast(base, n, sb, e, w, sharp);
+      }
       if (max(s.x, s.y) <= 1.0) {
-        // Magnify: 4x4 Catmull-Rom, unsharp vs. cubic B-spline from the same taps,
-        // clamped to the nearest 2x2 texels (no ringing / halos)
+        // 1080p -> 4K / near-1:1: 4x4 Catmull-Rom + FidelityFX RCAS contrast recovery
         let p = vuv * R - vec2f(0.5);
         let fp = floor(p);
         let f = p - fp;
@@ -571,32 +689,32 @@
         let mxc = vec2i(R) - vec2i(1);
         let wcx = crW(f.x);
         let wcy = crW(f.y);
-        let wbx = bsW(f.x);
-        let wby = bsW(f.y);
         var cr = vec3f(0.0);
-        var bs = vec3f(0.0);
         var mn = vec3f(1e9);
         var mxv = vec3f(-1e9);
         for (var j = 0; j < 4; j = j + 1) {
           for (var i = 0; i < 4; i = i + 1) {
             let t = textureLoad(resTex, clamp(ip + vec2i(i - 1, j - 1), vec2i(0), mxc), 0).rgb;
             cr = cr + t * (wcx[i] * wcy[j]);
-            bs = bs + t * (wbx[i] * wby[j]);
             if (i >= 1 && i <= 2 && j >= 1 && j <= 2) {
               mn = min(mn, t);
               mxv = max(mxv, t);
             }
           }
         }
-        return clamp(cr + (cr - bs) * (1.2 * sharp), mn, mxv);
+        let base = clamp(cr, mn, mxv);
+        let n = textureSampleLevel(resTex, samp, vuv + vec2f(0.0, -invR.y), 0.0).rgb;
+        let sb = textureSampleLevel(resTex, samp, vuv + vec2f(0.0,  invR.y), 0.0).rgb;
+        let e = textureSampleLevel(resTex, samp, vuv + vec2f( invR.x, 0.0), 0.0).rgb;
+        let w = textureSampleLevel(resTex, samp, vuv + vec2f(-invR.x, 0.0), 0.0).rgb;
+        return rcasContrast(base, n, sb, e, w, sharp);
       }
-      // Minify (s in (1, 2]): 4x4 bilinear taps spaced s/2 texels (each tap is a 2x2 prefilter),
-      // Lanczos-2 weights at +-s/4, +-3s/4; unsharp vs. the flat average of the same taps.
+      // Supersampled Minify (s in (1, 2], e.g. 1080p->3840x2160 downsampled to window):
+      // Lanczos-2 prefilter + RCAS 4K crispness
       let h = 0.5 * max(s, vec2f(1.0));
       let c = vuv * R;
       let lw = vec4f(0.105, 0.395, 0.395, 0.105);
       var acc = vec3f(0.0);
-      var flat = vec3f(0.0);
       var mn = vec3f(1e9);
       var mxv = vec3f(-1e9);
       for (var j = 0; j < 4; j = j + 1) {
@@ -604,15 +722,18 @@
           let pos = c + (vec2f(f32(i), f32(j)) - vec2f(1.5)) * h;
           let t = textureSampleLevel(resTex, samp, pos / R, 0.0).rgb;
           acc = acc + t * (lw[i] * lw[j]);
-          flat = flat + t;
           if (i >= 1 && i <= 2 && j >= 1 && j <= 2) {
             mn = min(mn, t);
             mxv = max(mxv, t);
           }
         }
       }
-      flat = flat * (1.0 / 16.0);
-      return clamp(acc + (acc - flat) * (0.30 + 0.90 * sharp), mn, mxv);
+      let base = clamp(acc, mn, mxv);
+      let n = textureSampleLevel(resTex, samp, vuv + vec2f(0.0, -stepR.y), 0.0).rgb;
+      let sb = textureSampleLevel(resTex, samp, vuv + vec2f(0.0,  stepR.y), 0.0).rgb;
+      let e = textureSampleLevel(resTex, samp, vuv + vec2f( stepR.x, 0.0), 0.0).rgb;
+      let w = textureSampleLevel(resTex, samp, vuv + vec2f(-stepR.x, 0.0), 0.0).rgb;
+      return rcasContrast(base, n, sb, e, w, sharp);
     }
 
     @fragment
@@ -1072,7 +1193,7 @@
       u[8] = p.shadowDepth;
       u[9] = p.aplGuard;
       u[10] = p.splitPos;
-      u[11] = (p.hdr ? 1 : 0) | (p.bypassNativeHdr ? 2 : 0);
+      u[11] = (p.hdr ? 1 : 0) | (p.bypassNativeHdr ? 2 : 0) | (p.sharpDirect ? 4 : 0);
       u[12] = p.srcW; u[13] = p.srcH; u[14] = p.frameSeed || 0; u[15] = reset ? 1 : 0;
       u[18] = p.sharpness; u[19] = 0;
       u[20] = p.outW; u[21] = p.outH;
@@ -1081,7 +1202,7 @@
       u[24] = 1 - Math.exp(-dt / 0.12);  // APL rising (guard engages)
       u[25] = 1 - Math.exp(-dt / 0.60);  // APL falling (guard releases)
       u[26] = 1 - Math.exp(-dt / 0.06);  // local map (and text attack)
-      u[27] = 1 - Math.exp(-dt / 0.40);  // text release
+      u[27] = 1 - Math.exp(-dt / 0.12);  // text release
 
       // p.tsw = { querySet, begin, end } lets the offscreen harness supply its own query slots
       const tsw = p.tsw || null;
@@ -1202,7 +1323,7 @@
     aplGuard: 0.45,
     upscaleQuality: 'quality', // 'fast' | 'quality'
     upscaleContent: 'live',    // 'live' | 'anime'
-    upscaleSharpness: 0.25,    // 0.0 .. 1.0
+    upscaleSharpness: 0.50,    // 0.0 .. 1.0
     bypassNativeHdr: true,
     splitEnabled: false,
     splitPos: 0.5,
@@ -1212,8 +1333,8 @@
   };
 
   const SR_TIERS = ['quality', 'fast', 'spatial'];
-  const SR_BUDGET_FRACTION = 0.6;   // of the video frame interval
-  const SR_BUDGET_STRIKES = 6;      // over-budget samples before stepping down
+  const SR_BUDGET_FRACTION = 0.78;   // of the video frame interval
+  const SR_BUDGET_STRIKES = 10;      // over-budget samples before stepping down
 
   let settings = { ...DEFAULT_SETTINGS };
   let isEdrDisplay = window.matchMedia('(dynamic-range: high)').matches;
@@ -1518,15 +1639,21 @@
 
       const canvas = document.createElement('canvas');
       canvas.setAttribute('data-truehdr', '1');
+      canvas.setAttribute('aria-hidden', 'true');
+      canvas.tabIndex = -1;
+      canvas.inert = true;
       Object.assign(canvas.style, {
         position: 'absolute',
-        pointerEvents: 'none',
         margin: '0',
         padding: '0',
         border: '0',
         background: 'transparent',
         display: 'none'
       });
+      canvas.style.setProperty('pointer-events', 'none', 'important');
+      canvas.style.setProperty('touch-action', 'none', 'important');
+      canvas.style.setProperty('user-select', 'none', 'important');
+      canvas.style.setProperty('-webkit-user-select', 'none', 'important');
       this.video.insertAdjacentElement('afterend', canvas);
       this.canvas = canvas;
       this.ctx = canvas.getContext('webgpu');
@@ -1546,8 +1673,7 @@
         position: 'absolute',
         width: '28px',
         marginLeft: '-14px',
-        cursor: 'ew-resize',
-        pointerEvents: 'auto',
+        pointerEvents: 'none',
         touchAction: 'none',
         userSelect: 'none',
         webkitUserSelect: 'none',
@@ -1560,8 +1686,8 @@
         top: '50%',
         left: '50%',
         transform: 'translate(-50%, -50%)',
-        width: '20px',
-        height: '42px',
+        width: '22px',
+        height: '44px',
         borderRadius: '999px',
         background: 'rgba(14, 16, 24, 0.78)',
         backdropFilter: 'blur(8px)',
@@ -1576,7 +1702,9 @@
         fontSize: '11px',
         fontWeight: '700',
         letterSpacing: '1px',
-        pointerEvents: 'none'
+        cursor: 'ew-resize',
+        pointerEvents: 'auto',
+        touchAction: 'none'
       });
       pill.textContent = '‹›';
       h.appendChild(pill);
@@ -1590,15 +1718,15 @@
         this.syncSplitHandle();
         this.renderFrame();
       };
-      h.addEventListener('pointerdown', (e) => {
+      pill.addEventListener('pointerdown', (e) => {
         if (e.button !== 0) return;
         e.preventDefault();
         e.stopPropagation();
         dragging = true;
-        try { h.setPointerCapture(e.pointerId); } catch (_) {}
+        try { pill.setPointerCapture(e.pointerId); } catch (_) {}
         updateFromEvent(e);
       });
-      h.addEventListener('pointermove', (e) => {
+      pill.addEventListener('pointermove', (e) => {
         if (!dragging) return;
         e.preventDefault();
         e.stopPropagation();
@@ -1608,13 +1736,13 @@
         if (!dragging) return;
         dragging = false;
         e.stopPropagation();
-        try { h.releasePointerCapture(e.pointerId); } catch (_) {}
+        try { pill.releasePointerCapture(e.pointerId); } catch (_) {}
         postToBridge('SET_SPLIT_POS', { splitPos: settings.splitPos });
       };
-      h.addEventListener('pointerup', stopDrag);
-      h.addEventListener('pointercancel', stopDrag);
+      pill.addEventListener('pointerup', stopDrag);
+      pill.addEventListener('pointercancel', stopDrag);
       for (const ev of ['mousedown', 'click', 'dblclick']) {
-        h.addEventListener(ev, (e) => e.stopPropagation());
+        pill.addEventListener(ev, (e) => e.stopPropagation());
       }
 
       anchor.insertAdjacentElement('afterend', h);
@@ -1700,7 +1828,8 @@
       const wantUpscale = Boolean(settings.effectiveUpscale);
       if (!wantHdr && !wantUpscale) return false;
       if (this.video.readyState < 2 || this.video.videoWidth === 0 || this.video.videoHeight === 0) return false;
-      if (document.fullscreenElement === this.video) return false;
+      const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+      if (fsEl === this.video) return false;
       if (this.blockedReason) return false;
       return true;
     }
@@ -1735,9 +1864,10 @@
     }
 
     // Canvas backing size:
-    //  - upscaling (display content > 1.1x source): exact device pixels of the video box
-    //  - otherwise: content at min(source, display) pixels (1:1 texel-aligned when the display is
-    //    larger); the compositor scales the canvas up, so the GPU only shades source pixels.
+    //  - upscaling: active whenever source is below 4K (3840x2160) or display exceeds source; targets
+    //    at least 4K supersampling (capped at 2x source / 3840x2160 / display pixels) so 720p/1080p/1440p
+    //    videos get real 4K detail even in theater/windowed Safari.
+    //  - HDR-only: content at min(source, display) pixels for low GPU power.
     computeCanvasPlan(boxCssW, boxCssH, rect) {
       const dpr = Math.min(window.devicePixelRatio || 1, 3);
       const maxDim = gpuState.device ? gpuState.device.limits.maxTextureDimension2D : 8192;
@@ -1746,10 +1876,25 @@
       const [ox, oy, rw, rh] = rect;
       const boxW = boxCssW * dpr;
       const boxH = boxCssH * dpr;
+      const below4k = vw < 3840 && vh < 2160;
       const upRatio = Math.max((boxW * rw) / vw, (boxH * rh) / vh);
-      const upscale = Boolean(settings.effectiveUpscale) && upRatio > 1.1;
+      const upscale = Boolean(settings.effectiveUpscale) && (upRatio > 1.05 || (below4k && upRatio > 0.75));
 
-      if (!upscale && upRatio > 1.0) {
+      let targetW = boxW;
+      let targetH = boxH;
+      if (upscale && below4k) {
+        const capW = vw >= vh ? Math.min(3840, maxDim) : Math.min(2160, maxDim);
+        const capH = vw >= vh ? Math.min(2160, maxDim) : Math.min(3840, maxDim);
+        const curCW = boxW * Math.min(rw, 1.0);
+        const curCH = boxH * Math.min(rh, 1.0);
+        const desireW = Math.max(curCW, Math.min(capW, vw * 2));
+        const desireH = Math.max(curCH, Math.min(capH, vh * 2));
+        const boost = Math.max(desireW / Math.max(curCW, 1), desireH / Math.max(curCH, 1));
+        if (boost > 1.0) {
+          targetW *= boost;
+          targetH *= boost;
+        }
+      } else if (!upscale && upRatio > 1.0) {
         let cw = Math.max(1, Math.round(vw / rw));
         let ch = Math.max(1, Math.round(vh / rh));
         if (cw <= maxDim && ch <= maxDim) {
@@ -1758,9 +1903,9 @@
           return { upscale, cw, ch, rectUniform: [offX / cw, offY / ch, vw / cw, vh / ch], outW: vw, outH: vh };
         }
       }
-      const k = Math.min(1, maxDim / Math.max(boxW, 1), maxDim / Math.max(boxH, 1));
-      const cw = Math.max(1, Math.round(boxW * k));
-      const ch = Math.max(1, Math.round(boxH * k));
+      const k = Math.min(1, maxDim / Math.max(targetW, 1), maxDim / Math.max(targetH, 1));
+      const cw = Math.max(1, Math.round(targetW * k));
+      const ch = Math.max(1, Math.round(targetH * k));
       return {
         upscale,
         cw,
@@ -1842,15 +1987,17 @@
       this.contentOutW = plan.outW;
       this.contentOutH = plan.outH;
 
-      const rectKey = `${left.toFixed(1)},${top.toFixed(1)},${vRect.width.toFixed(1)},${vRect.height.toFixed(1)},${cw},${ch},${cs.zIndex},${cs.borderRadius}`;
+      const rectKey = `${left.toFixed(1)},${top.toFixed(1)},${vRect.width.toFixed(1)},${vRect.height.toFixed(1)},${cw},${ch},${cs.zIndex},${cs.borderRadius},${Boolean(this.video.controls)}`;
       if (rectKey !== this.lastRectKey) {
         this.lastRectKey = rectKey;
         this.canvas.style.left = `${left}px`;
         this.canvas.style.top = `${top}px`;
         this.canvas.style.width = `${vRect.width}px`;
         this.canvas.style.height = `${vRect.height}px`;
-        this.canvas.style.zIndex = cs.zIndex === 'auto' ? '0' : cs.zIndex;
+        this.canvas.style.zIndex = cs.zIndex;
         this.canvas.style.borderRadius = cs.borderRadius;
+        this.canvas.style.clipPath = this.video.controls ? 'inset(0 0 64px 0)' : '';
+        this.canvas.style.setProperty('pointer-events', 'none', 'important');
 
         if (this.canvas.width !== cw || this.canvas.height !== ch || this.configuredWidth === 0) {
           this.canvas.width = cw;
@@ -1893,11 +2040,17 @@
       const maxDim = gpuState.device.limits.maxTextureDimension2D;
       if (2 * vw > maxDim || 2 * vh > maxDim) return spatial('source too large for SR');
 
-      // A second 2x instance costs 4x the first (it runs on the 2x image); only chain it when a
-      // plain resample would have to stretch > 1.6x more and the intermediate is <= 1440p.
+      // Pass 1 produces 2x AI-restored video (e.g. 1080p -> 4K, 720p -> 1440p). For >2x output
+      // (720p -> 4K), only chain a second neural pass for low-res / Fast tier at <=30 fps; for Quality
+      // or 60 fps, directional EASU + RCAS in fsSR completes 1440p -> 4K cleanly in <0.5 ms without
+      // stalling or triggering budget demotion.
       const ratio = Math.max(outW / vw, outH / vh);
       let passes = 1;
-      if (ratio / 2 > 1.6 && 2 * vh <= 1440 && 4 * vw <= maxDim && 4 * vh <= maxDim) passes = 2;
+      if (ratio / 2 > 1.6 && 2 * vh <= 1440 && 4 * vw <= maxDim && 4 * vh <= maxDim) {
+        if ((tier === 'fast' && this.frameIntervalMs >= 28) || (2 * vw <= 1280 && 2 * vh <= 720)) {
+          passes = 2;
+        }
+      }
 
       const modelId = `tsr-${content}-${tier}`;
       const insts = this.ensureSRInstances(rt, modelId, passes);
@@ -2046,6 +2199,7 @@
           splitPos: settings.splitEnabled ? settings.splitPos : -1.0,
           hdr: Boolean(settings.effectiveHdr),
           bypassNativeHdr: Boolean(settings.bypassNativeHdr),
+          sharpDirect: Boolean(settings.effectiveUpscale),
           sharpness: typeof settings.upscaleSharpness === 'number' ? settings.upscaleSharpness : DEFAULT_SETTINGS.upscaleSharpness,
           mode: plan.mode,
           sr: plan.sr,

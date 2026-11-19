@@ -13,7 +13,7 @@ const DEFAULT_SETTINGS = {
   aplGuard: 0.45,
   upscaleQuality: 'quality',
   upscaleContent: 'live',
-  upscaleSharpness: 0.25,
+  upscaleSharpness: 0.50,
   bypassNativeHdr: true,
   splitEnabled: false,
   splitPos: 0.5,

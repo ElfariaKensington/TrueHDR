@@ -24,10 +24,9 @@
   var BIC = [[-0.03515625, 0.26171875, 0.87890625, -0.10546875],
              [-0.10546875, 0.87890625, 0.26171875, -0.03515625]];
 
-  // Defaults from dev/sr/webkit_run.ts bench (real WebKit WGSL compiler, M1 Pro, f16): one pixel
-  // per invocation on 8x8 workgroups is 1.7-2.7x faster than 2x2 pixel blocks for every shipped
-  // model (2x2 blocks spill registers at >= 12 channels; 16-ch layers were 2.6x slower).
-  var DEFAULT_CONFIG = { wx: 8, wy: 8, px: 1, py: 1, scalarPx: 1, scalarPy: 1, pointwisePx: 1, pointwisePy: 1 };
+  // Defaults benchmarked in real WebKit (webkit_run.ts, M1 Pro, f16): direct texture loads on 16x8
+  // workgroups (1 px/invocation) avoid shared-memory staging barriers (~1.3-1.6x faster in WebKit).
+  var DEFAULT_CONFIG = { wx: 16, wy: 8, px: 1, py: 1, scalarPx: 1, scalarPy: 1, pointwisePx: 1, pointwisePy: 1, direct: true };
 
   // ---------------------------------------------------------------- model data
   function b64ToBytes(s) {
