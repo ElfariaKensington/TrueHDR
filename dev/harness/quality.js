@@ -15,6 +15,39 @@ const S = { ...PRESETS[args.preset || 'vivid'], upscaleSharpness: 0.25 };
 
 const { device } = await getDevice();
 
+// Caption box + lower-third metrics for a text still: peak, core-gain spread, rim inversion.
+function textMetrics(r, a, tag) {
+  const [x0, y0, x1, y1] = a.fr.meta.caption;
+  let pk = 0;
+  for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) pk = Math.max(pk, a.L[y * a.fr.w + x]);
+  r[`${tag} peak (x SDR white)`] = pk;
+  // Glyph rendering: every full-white stroke core should get the same gain (spread = patches /
+  // boxes), and no antialiased edge pixel may come out brighter than the cores (rim inversion).
+  const core = [];
+  let rim = 0;
+  let edgeN = 0;
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      const i = y * a.fr.w + x;
+      if (a.Lin[i] >= 0.95) core.push(a.L[i]);
+    }
+  }
+  core.sort((p, q) => p - q);
+  const coreMed = core[core.length >> 1] || 0;
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      const i = y * a.fr.w + x;
+      if (a.Lin[i] > 0.25 && a.Lin[i] < 0.8) { edgeN++; if (a.L[i] > coreMed * 1.001) rim++; }
+    }
+  }
+  r[`${tag} core gain spread`] = core.length ? (core[core.length - 1] - core[0]) / coreMed : 0;
+  r[`${tag} rim inversion frac`] = edgeN ? rim / edgeN : 0;
+  const [lx0, ly0, lx1, ly1] = a.fr.meta.lowerThird;
+  let lpk = 0;
+  for (let y = ly0; y < ly1; y++) for (let x = lx0; x < lx1; x++) lpk = Math.max(lpk, a.L[y * a.fr.w + x]);
+  r[`${tag} lower-third peak (x SDR white)`] = lpk;
+}
+
 async function makeRunner(kind) {
   const p = kind === 'old' ? await OldRenderer.create(device, rev) : await NewPipeline.create(device);
   return p;
@@ -144,11 +177,10 @@ for (const kind of ['old', 'new']) {
 
   // ---- text: caption peak; white page gain
   {
-    const a = await still(kind, 'text_1920x1080');
-    const [x0, y0, x1, y1] = a.fr.meta.caption;
-    let pk = 0;
-    for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) pk = Math.max(pk, a.L[y * a.fr.w + x]);
-    r['caption peak (x SDR white)'] = pk;
+    for (const [key, tag] of [['text_1920x1080', 'caption'], ['ui_1920x1080', 'ui']]) {
+      const a = await still(kind, key);
+      textMetrics(r, a, tag);
+    }
     const wp = await still(kind, 'white_page_1920x1080');
     const all = () => true;
     r['white page gain'] = meanIn(wp.L, wp.fr.w, all, 0, 0, wp.fr.w, wp.fr.h) / meanIn(wp.Lin, wp.fr.w, all, 0, 0, wp.fr.w, wp.fr.h);

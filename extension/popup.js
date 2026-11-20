@@ -180,10 +180,12 @@ function renderStatus(status) {
   corsBanner.classList.add('hidden');
   if (!settings.upscaleEnabled) {
     resBadge.textContent = status && status.sourceRes ? `${status.sourceRes} (Off)` : 'Off';
+  } else if (status && status.sourceRes && status.outputRes && status.upscalingActive) {
+    resBadge.textContent = `${status.sourceRes} → ${status.outputRes}`;
   } else {
-    resBadge.textContent = status && status.sourceRes && status.outputRes
-      ? `${status.sourceRes} → ${status.outputRes}`
-      : 'Native';
+    // Source already >= the on-screen size: shown as-is, no upscale (an arrow here would
+    // read as "upscaled to" a smaller size).
+    resBadge.textContent = status && status.sourceRes ? `${status.sourceRes} (native)` : 'Native';
   }
 
   if (!settings.enabled) {

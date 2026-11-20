@@ -215,6 +215,18 @@ def text_frame(w, h):
     return img, {'caption': cap, 'lowerThird': lt, 'specks': specks}
 
 
+def ui_frame(w, h):
+    # Game loading screen: large white UI text and a saturated ring on pure black.
+    img = np.zeros((h, w, 3), np.float32)
+    px = max(16, int(h * 0.045))
+    a = lower_third(img, 'Select sunglasses with the Switch Action Window Key, then put', int(0.08 * w), int(0.42 * h), px, (255, 255, 255))
+    b = lower_third(img, 'them on using the Action Key. Now you can see hidden items!', int(0.08 * w), int(0.42 * h) + int(px * 1.25), px, (255, 255, 255))
+    c = lower_third(img, 'Now Loading', int(0.62 * w), int(0.80 * h), int(px * 1.4), (255, 255, 255))
+    blend_shape(img, 0.56 * w, 0.83 * h, 0.03 * h, 0.03 * h, (255, 230, 20))
+    blend_shape(img, 0.56 * w, 0.83 * h, 0.02 * h, 0.02 * h, (0, 0, 0))
+    return img, {'caption': [a[0], a[1], b[2], b[3]], 'lowerThird': list(c)}
+
+
 def cut_seq(w, h, n_night=20, n_white=20):
     night_img = night(w, h)
     for i, s in enumerate([4, 8, 16]):
@@ -244,6 +256,8 @@ def build_frames():
         img, meta = text_frame(w, h)
         write_frames(manifest, 'text', [img], w, h, meta)
         write_frames(manifest, 'white_page', [white_page(w, h)], w, h)
+    img, meta = ui_frame(1920, 1080)
+    write_frames(manifest, 'ui', [img], 1920, 1080, meta)
     frames, meta = move_seq(1920, 1080)
     write_frames(manifest, 'move', frames, 1920, 1080, meta)
     frames, ref = pump_seq(1920, 1080)
