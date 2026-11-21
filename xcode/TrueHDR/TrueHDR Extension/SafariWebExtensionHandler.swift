@@ -5,7 +5,6 @@
 //  Created by Elfaria on 15.11.2026.
 //
 
-import AppKit
 import SafariServices
 import os.log
 
@@ -28,48 +27,16 @@ class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling {
             message = request?.userInfo?["message"]
         }
 
-        let reply: [String: Any]
-        if let dict = message as? [String: Any], dict["type"] as? String == "APP_STATE" {
-            reply = Self.appState()
-        } else {
-            os_log(.default, "Received message from browser.runtime.sendNativeMessage: %@ (profile: %@)", String(describing: message), profile?.uuidString ?? "none")
-            reply = [ "echo": message as Any ]
-        }
+        os_log(.default, "Received message from browser.runtime.sendNativeMessage: %@ (profile: %@)", String(describing: message), profile?.uuidString ?? "none")
 
         let response = NSExtensionItem()
         if #available(iOS 15.0, macOS 11.0, *) {
-            response.userInfo = [ SFExtensionMessageKey: reply ]
+            response.userInfo = [ SFExtensionMessageKey: [ "echo": message ] ]
         } else {
-            response.userInfo = [ "message": reply ]
+            response.userInfo = [ "message": [ "echo": message ] ]
         }
 
         context.completeRequest(returningItems: [ response ], completionHandler: nil)
-    }
-
-    // Stock WebKit clamps page EDR to 1.6x while Safari is not the frontmost app; the engine then
-    // refits its tone curve. Safari web apps (com.apple.Safari.WebApp.*) count as Safari. The clamp
-    // is lifted by a patched WebKit (SafariForWebKitDevelopment / the PatchedSafari launcher) or by
-    // tools/edr-unsuppress, which can only be injected into Safari with SIP off.
-    private static func appState() -> [String: Any] {
-        let front = NSWorkspace.shared.frontmostApplication
-        let bid = front?.bundleIdentifier ?? ""
-        let patched = NSWorkspace.shared.runningApplications.contains { app in
-            app.bundleIdentifier == "com.elfaria.PatchedSafari"
-                || app.executableURL?.lastPathComponent == "SafariForWebKitDevelopment"
-        }
-        return [
-            "frontmost": bid,
-            "safariFrontmost": bid.hasPrefix("com.apple.Safari"),
-            "sipOff": sipAllowsDyldInjection(),
-            "unsuppressedWebKit": patched || sipAllowsDyldInjection()
-        ]
-    }
-
-    // csr_check(CSR_ALLOW_UNRESTRICTED_FS) == 0 when SIP is disabled ("csrutil disable").
-    private static func sipAllowsDyldInjection() -> Bool {
-        typealias CsrCheck = @convention(c) (UInt32) -> Int32
-        guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "csr_check") else { return false }
-        return unsafeBitCast(sym, to: CsrCheck.self)(1 << 1) == 0
     }
 
 }

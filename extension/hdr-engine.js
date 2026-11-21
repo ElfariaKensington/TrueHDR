@@ -48,7 +48,7 @@
       tone: vec4f,   // peakBoost, threshold, localPunch, gamutBoost
       extra: vec4f,  // shadowDepth, aplGuard, splitPos (<0 = off), flags (1 = HDR, 2 = bypass native HDR)
       info: vec4f,   // srcW, srcH, frameSeed, reset
-      res: vec4f,    // resample texture W, H, sharpness, EDR headroom cap (0 = none)
+      res: vec4f,    // resample texture W, H, sharpness, unused
       outp: vec4f,   // content output W, H (canvas px), map uv scale x, y
       stat: vec4f,   // APL alpha up, APL alpha down, map alpha (also text attack), text alpha release
     };
@@ -158,31 +158,12 @@
         }
         // Strong perceptual transitions between neighbouring quads (24 pairs)
         var edges = 0.0;
-        var pmin = pv[0];
-        var pmax = pv[0];
         for (var r = 0; r < 4; r = r + 1) {
           for (var c = 0; c < 3; c = c + 1) {
             edges = edges + step(0.22, abs(pv[r * 4 + c] - pv[r * 4 + c + 1]));
             edges = edges + step(0.22, abs(pv[c * 4 + r] - pv[c * 4 + r + 4]));
           }
         }
-        for (var i = 1; i < 16; i = i + 1) {
-          pmin = min(pmin, pv[i]);
-          pmax = max(pmax, pv[i]);
-        }
-        // UI text / captions: bright glyph fill on a flat dark backdrop. Nearly every tap sits at
-        // the cell's min or max, the bright tone is the minority and the backdrop is dark. Natural
-        // texture (foliage, rock, water) is a continuum, and branches against sky are a dark
-        // minority on a bright majority; neither may count, or their highlights get the text cap.
-        var nHi = 0.0;
-        var nLo = 0.0;
-        for (var i = 0; i < 16; i = i + 1) {
-          nHi = nHi + select(0.0, 1.0, pv[i] > pmax - 0.08);
-          nLo = nLo + select(0.0, 1.0, pv[i] < pmin + 0.08);
-        }
-        let flatTones = smoothstep(0.45, 0.70, (nHi + nLo) / 16.0) * smoothstep(0.30, 0.50, pmax - pmin)
-          * smoothstep(0.55, 0.75, pmax) * (1.0 - smoothstep(0.20, 0.35, pmin))
-          * smoothstep(0.25, 0.40, nLo / 16.0) * (1.0 - smoothstep(0.55, 0.70, nHi / 16.0));
         // Robust cell level: median of the four 4x4-pixel group medians (median-of-4 = mean of the
         // middle two). Rejects small objects (birds, specks) whatever their contrast.
         let g0 = med4(q[0], q[1], q[4], q[5]);
@@ -190,7 +171,7 @@
         let g2 = med4(q[8], q[9], q[12], q[13]);
         let g3 = med4(q[10], q[11], q[14], q[15]);
         let cellY = sumY / 16.0;
-        textureStore(cellOut, vec2i(gid.xy), vec4f(cellY, med4(g0, g1, g2, g3), edges / 24.0 * flatTones, hdr / 16.0));
+        textureStore(cellOut, vec2i(gid.xy), vec4f(cellY, med4(g0, g1, g2, g3), edges / 24.0, hdr / 16.0));
         atomicAdd(&wHist[min(u32(pow(cellY, 1.0 / 2.2) * 32.0), 31u)], 1u);
         atomicAdd(&wAcc[0], u32(round(min(cellY, 16.0) * 1024.0)));
         atomicAdd(&wAcc[1], u32(round(hdr * 64.0)));
@@ -312,7 +293,7 @@
     }
   `;
 
-  // Local adaptation map at cell resolution (8x8 cells per workgroup, 20x12 shared tile).
+  // Local adaptation map at cell resolution (8x8 cells per workgroup, 14x10 shared tile).
   const MAP_CS = /* wgsl */ `
     ${WGSL_COMMON}
     @group(0) @binding(0) var cellTex: texture_2d<f32>;
@@ -321,8 +302,8 @@
     @group(0) @binding(3) var<storage, read> st: State;
     @group(0) @binding(4) var<uniform> u: FrameU;
 
-    var<workgroup> tM: array<f32, 240>;  // 20x12 tile: 6-cell halo left/right, 2 top/bottom
-    var<workgroup> tD: array<f32, 240>;
+    var<workgroup> tM: array<f32, 140>;
+    var<workgroup> tD: array<f32, 140>;
 
     fn cs(a: ptr<function, f32>, b: ptr<function, f32>) {
       let lo = min(*a, *b);
@@ -357,20 +338,20 @@
     ) {
       let dims = vec2i(textureDimensions(cellTex));
       let mxc = dims - vec2i(1);
-      let origin = vec2i(wid.xy) * 8 - vec2i(6, 2);
-      for (var k = li; k < 240u; k = k + 64u) {
-        let t = textureLoad(cellTex, clamp(origin + vec2i(i32(k % 20u), i32(k / 20u)), vec2i(0), mxc), 0);
+      let origin = vec2i(wid.xy) * 8 - vec2i(3, 1);
+      for (var k = li; k < 140u; k = k + 64u) {
+        let t = textureLoad(cellTex, clamp(origin + vec2i(i32(k % 14u), i32(k / 14u)), vec2i(0), mxc), 0);
         tM[k] = t.y;
         tD[k] = t.z;
       }
       workgroupBarrier();
       let c = vec2i(wid.xy) * 8 + vec2i(lid.xy);
       if (c.x >= dims.x || c.y >= dims.y) { return; }
-      let tc = i32(lid.y + 2u) * 20 + i32(lid.x + 6u);
+      let tc = i32(lid.y + 1u) * 14 + i32(lid.x + 3u);
 
-      let m0 = tM[tc - 21]; let m1 = tM[tc - 20]; let m2 = tM[tc - 19];
+      let m0 = tM[tc - 15]; let m1 = tM[tc - 14]; let m2 = tM[tc - 13];
       let m3 = tM[tc - 1];  let m4 = tM[tc];      let m5 = tM[tc + 1];
-      let m6 = tM[tc + 19]; let m7 = tM[tc + 20]; let m8 = tM[tc + 21];
+      let m6 = tM[tc + 13]; let m7 = tM[tc + 14]; let m8 = tM[tc + 15];
       // Median of the 3x3 cell levels rejects objects spanning up to ~2x2 cells; then a
       // range-weighted mean around it keeps the map smooth.
       let med = median9(m0, m1, m2, m3, m4, m5, m6, m7, m8);
@@ -384,48 +365,10 @@
       // never drag down the background reference and create white halos on adjacent light pixels.
       let cardHi = max(max(m1, m3), max(m5, m7));
       let B = max(bsum / max(wc + we + w4, 1e-6), mix(med, cardHi, 0.75));
-      // Caption / UI text: dense strong edges spread over a 56x24 px window (7x3 cells).
-      // An isolated speck or bird lights one or two cells and stays far below threshold.
-      // Max over the window centred one cell up/here/down = 1-cell vertical dilation, so
-      // ascenders/descenders poking out of a line's band stay inside the mask.
-      // Text also forms lines: within one cell row, a 7-cell run (ending at, centred on or
-      // starting at this cell) is mostly glyph cells. Scattered look-alikes (sky through foliage)
-      // rarely fill a row run.
-      var rows: array<f32, 5>;
-      var line = 0.0;
-      for (var dy = -2; dy <= 2; dy = dy + 1) {
-        var rsum = 0.0;
-        for (var dx = -3; dx <= 3; dx = dx + 1) {
-          rsum = rsum + tD[tc + dy * 20 + dx];
-        }
-        rows[dy + 2] = rsum;
-        if (dy >= -1 && dy <= 1) {
-          var hit: array<f32, 13>;
-          for (var dx = -6; dx <= 6; dx = dx + 1) {
-            hit[dx + 6] = smoothstep(0.015, 0.04, tD[tc + dy * 20 + dx]);
-          }
-          var runL = 0.0;
-          var runC = 0.0;
-          var runR = 0.0;
-          for (var j = 0; j < 7; j = j + 1) {
-            runL = runL + hit[j];
-            runC = runC + hit[j + 3];
-            runR = runR + hit[j + 6];
-          }
-          line = max(line, max(runC, max(runL, runR)) / 7.0);
-        }
-      }
-      let dens = max(rows[1] + rows[2] + rows[3], max(rows[0] + rows[1] + rows[2], rows[2] + rows[3] + rows[4]));
-      let text = smoothstep(0.03, 0.08, dens / 21.0) * smoothstep(0.55, 0.80, line);
-      let prevT = textureLoad(prevMap, c, 0).y;
-      let aT = select(u.stat.w, u.stat.z, text > prevT);
-      let outT = select(clamp(mix(prevT, text, aT), 0.0, 1.0), text, st.cut > 0.5);
 
-      // Instant spatial background (zero temporal ghosting behind moving objects); only the
-      // text score is smoothed (fast attack, short release) so captions never flicker.
-      // z = plain 3x3 median: the backdrop behind bold glyphs that fill their own cells (B
-      // then sits at glyph level, so such text would no longer read as "above background").
-      textureStore(mapOut, c, vec4f(B, outT, med, 1.0));
+      // Instant spatial background (zero temporal ghosting behind moving objects) and no
+      // coarse 56x24 box gain-clamping (prevents grey halo/box corruption around fonts).
+      textureStore(mapOut, c, vec4f(B, 0.0, 0.0, 1.0));
     }
   `;
 
@@ -482,7 +425,7 @@
 
     // Edge-aware slice of the 1/8-res map: 2x2 joint-bilateral weights pick the cells whose
     // background level matches this pixel, so large edges never bleed across (halo-free).
-    fn sliceMap(vuv: vec2f, L: f32) -> vec3f {
+    fn sliceMap(vuv: vec2f, L: f32) -> vec2f {
       let muv = vuv * u.outp.zw;
       let g = textureGather(0, mapTex, samp, muv);
       let f = fract(muv * vec2f(textureDimensions(mapTex)) - vec2f(0.5));
@@ -494,11 +437,8 @@
       let x = max(vec4f(1.0) - k * d * d, vec4f(0.0));
       let w = bw * (x * x + vec4f(1e-4));
       let B = dot(w, g) / max(dot(w, vec4f(1.0)), 1e-6);
-      // Text score: max of the 2x2 footprint (no bilinear fall-off across glyph tops at a
-      // mask edge); the backdrop median is plain bilinear.
-      let gt = textureGather(1, mapTex, samp, muv);
-      let t = textureSampleLevel(mapTex, samp, muv, 0.0).z;
-      return vec3f(B, max(max(gt.x, gt.y), max(gt.z, gt.w)), t);
+      let t = textureSampleLevel(mapTex, samp, muv, 0.0).y;
+      return vec2f(B, t);
     }
 
     fn toneMapHDR(c0: vec3f, vuv: vec2f, fragPos: vec4f) -> vec4f {
@@ -513,10 +453,8 @@
       let loc = sliceMap(vuv, L);
       let bg = exp2(loc.x);
       let detail = max(0.0, E - bg * 1.15);
-      // Text protection only for glyph pixels well above the local backdrop inside text-dense
-      // regions (dark text on a bright page stays below its backdrop and is left alone).
-      let strokeLift = max(detail, E - exp2(loc.z) * 1.15);
-      let textProt = clamp(loc.y, 0.0, 1.0) * smoothstep(0.08, 0.28, strokeLift);
+      // Text protection only for pixels well above their background inside text-dense regions
+      let textProt = clamp(loc.y, 0.0, 1.0) * smoothstep(0.10, 0.32, detail);
 
       // Deep-black-only shadow floor (< 0.015 linear), kept gentle to avoid dark silhouette crush
       var shadowRatio = 1.0;
@@ -529,33 +467,16 @@
       // EDR highlight curve above the knee (white-screen guarded peak) from the LUT
       var hdrGain = lut.x;
 
-      // Text: scale the EDR lift so the curve tops out at the text cap instead of the peak.
-      // Monotone in E, so antialiased edges keep their shape (a hard min() cap flattened stroke
-      // cores against their edges and drew grey rims/boxes around glyphs).
-      let capK = clamp((scene.v.w - 1.0) / max(scene.v.z - 1.0, 1e-3), 0.0, 1.0);
-      hdrGain = mix(hdrGain, 1.0 + (hdrGain - 1.0) * capK, textProt);
-
       // Local specular punch: only genuine bright local highlights above background
-      let localMask = smoothstep(0.08, 0.32, detail) * lut.y * (1.0 - textProt);
+      let localMask = smoothstep(0.08, 0.32, detail) * lut.y * (1.0 - textProt * 0.85);
       hdrGain = hdrGain * (1.0 + u.tone.z * 0.50 * localMask);
+
+      hdrGain = mix(hdrGain, min(hdrGain, scene.v.w), textProt * 0.85);
 
       var hdrP3 = p3Linear * (hdrGain * shadowRatio);
       let p3Y = lumaP3(hdrP3);
       let satScale = 1.0 + lut.z * (1.0 - textProt * 0.6);
       hdrP3 = max(vec3f(0.0), mix(vec3f(p3Y), hdrP3, satScale));
-
-      // Background Safari: stock WebKit caps page EDR at u.res.w. Keep the focused curve up to a
-      // knee and roll everything above it softly into the cap (scaled by the max channel, so hue
-      // holds) instead of letting the compositor hard-clip highlights flat.
-      let cap = u.res.w;
-      if (cap > 1.0) {
-        let knee = 1.0 + (cap - 1.0) * 0.35;
-        let m = max(hdrP3.r, max(hdrP3.g, hdrP3.b));
-        if (m > knee) {
-          let room = cap - knee;
-          hdrP3 = hdrP3 * ((knee + room * (1.0 - exp((knee - m) / room))) / m);
-        }
-      }
 
       var outP3 = linearToSrgbExt(hdrP3);
       let d1 = ign(fragPos.xy + vec2f(u.info.z * 17.0, 0.0));
@@ -1245,7 +1166,7 @@
       u[10] = p.splitPos;
       u[11] = (p.hdr ? 1 : 0) | (p.bypassNativeHdr ? 2 : 0) | (p.sharpDirect ? 4 : 0);
       u[12] = p.srcW; u[13] = p.srcH; u[14] = p.frameSeed || 0; u[15] = reset ? 1 : 0;
-      u[18] = p.sharpness; u[19] = p.headroomCap > 1 ? p.headroomCap : 0;
+      u[18] = p.sharpness; u[19] = 0;
       u[20] = p.outW; u[21] = p.outH;
       u[22] = p.srcW / (CELL * this.cellsW);
       u[23] = p.srcH / (CELL * this.cellsH);
@@ -1416,20 +1337,6 @@
   function postToBridge(kind, payload) {
     window.postMessage({ channel: CHANNEL, from: 'engine', kind, payload }, '*');
   }
-
-  // Background-app EDR limit. While Safari is not the frontmost app, stock WebKit lowers the
-  // screen headroom it reports to every web/GPU process to 1.6x (WebProcessPool::
-  // applyEDRSuppressionIfNeeded, on NSApplicationShouldBeginSuppressingHighDynamicRange-
-  // ContentNotification); canvas, <img> and <video> are all capped and nothing on the page can
-  // exceed it (measured with dev/focus-test on Safari 27.3). A curve rendered for 6x then
-  // hard-clips every highlight flat at 1.6x, so the final pass keeps the curve below a knee and
-  // rolls the rest softly into the limit (headroomCap -> FrameU res.w).
-  // Another Safari window being key keeps full headroom, so page focus alone is not enough: the
-  // bridge asks the native app whether Safari is frontmost and whether the clamp is lifted
-  // (tools/edr-unsuppress with SIP off, or a patched WebKit).
-  const SUPPRESSED_HEADROOM = 1.6;
-  let appInactive = false;
-
 
   // Listen for dynamic range changes (e.g., moving window between XDR and external SDR monitor)
   try {
@@ -2299,7 +2206,6 @@
           outW: this.contentOutW,
           outH: this.contentOutH,
           tone: [settings.peakBoost, settings.threshold, settings.localPunch, settings.gamutBoost],
-          headroomCap: appInactive ? SUPPRESSED_HEADROOM : 0,
           shadowDepth: settings.shadowDepth,
           aplGuard: settings.aplGuard,
           splitPos: settings.splitEnabled ? settings.splitPos : -1.0,
@@ -3150,7 +3056,6 @@
           outW: p.outW,
           outH: p.outH,
           tone: [settings.peakBoost, settings.threshold, settings.localPunch, settings.gamutBoost],
-          headroomCap: appInactive ? SUPPRESSED_HEADROOM : 0,
           shadowDepth: settings.shadowDepth,
           aplGuard: settings.aplGuard,
           splitPos: settings.splitEnabled ? settings.splitPos : -1.0,
@@ -3475,30 +3380,6 @@
     });
   }
 
-  function setAppInactive(v) {
-    if (v === appInactive) return;
-    appInactive = v;
-    for (const inst of instances.values()) {
-      inst.dirtyRender = true;
-      inst.scheduleRenderOnce();
-    }
-    for (const p of images.values()) p.requestRender();
-  }
-
-  // Focused page => Safari is active (no query). Otherwise ask the bridge; the background caches
-  // the native answer, so many frames polling cost one native round trip per 250 ms at most.
-  function refreshAppState() {
-    if (!instances.size && !images.size) return;
-    if (document.hasFocus()) {
-      setAppInactive(false);
-      return;
-    }
-    postToBridge('QUERY_APP_STATE', {});
-  }
-  window.addEventListener('blur', refreshAppState);
-  window.addEventListener('focus', refreshAppState);
-  setInterval(refreshAppState, 500);
-
   const SHORTCUTS = {
     KeyM: ['TOGGLE_MASTER', () => `TrueHDR: ${!settings.enabled ? 'ON' : 'OFF'}`],
     KeyH: ['TOGGLE_HDR', () => (!settings.hdrEnabled ? `HDR: ON (${settings.peakBoost.toFixed(1)}x EDR)` : 'HDR: OFF')],
@@ -3600,9 +3481,6 @@
         imgFetchPending.delete(payload.id);
         resolve(payload);
       }
-    } else if (data.kind === 'APP_STATE') {
-      const payload = data.payload || {};
-      setAppInactive(!document.hasFocus() && payload.inactive !== false);
     } else if (data.kind === 'RETRY_CORS') {
       for (const inst of instances.values()) {
         if (inst.blockedReason && inst.blockedReason.includes('CORS')) {

@@ -156,15 +156,6 @@
         }
       }
       postToMain('IMAGE_DATA', { id, ok: Boolean(blob), error: blob ? null : (resp && resp.error) || 'fetch failed', blob });
-    } else if (data.kind === 'QUERY_APP_STATE') {
-      // inactive: true/false from the native app; null if it could not answer (the engine then
-      // assumes the page lost focus to another app, which is when stock Safari clamps EDR).
-      let inactive = null;
-      try {
-        const resp = await ext.runtime.sendMessage({ type: 'TRUEHDR_APP_STATE' });
-        if (resp && typeof resp.inactive === 'boolean') inactive = resp.inactive;
-      } catch (_) {}
-      postToMain('APP_STATE', { inactive });
     } else if (data.kind === 'TOGGLE_SPLIT') {
       await updateStoredSettings((cur) => { cur.splitEnabled = !cur.splitEnabled; });
     } else if (data.kind === 'SET_SPLIT_POS') {
