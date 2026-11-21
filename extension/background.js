@@ -88,6 +88,31 @@ if (ext.runtime.onStartup) {
 
 ensureMainWorldScriptRegistered();
 
+// Is Safari in the background with its EDR clamped to 1.6x? Asked by unfocused frames every
+// 500 ms; one native round trip serves all of them for APP_STATE_TTL_MS.
+// Resolves true/false, or null when the native app cannot answer.
+const APP_STATE_TTL_MS = 250;
+let appState = { at: 0, value: null, pending: null };
+
+function queryAppInactive() {
+  if (Date.now() - appState.at < APP_STATE_TTL_MS) return Promise.resolve(appState.value);
+  if (appState.pending) return appState.pending;
+  appState.pending = (async () => {
+    try {
+      const r = await ext.runtime.sendNativeMessage('com.elfaria.TrueHDR', { type: 'APP_STATE' });
+      if (!r || typeof r.safariFrontmost !== 'boolean') return null;
+      // Clamp lifted (EDRUnsuppress with SIP off, or a patched WebKit): keep the full curve.
+      return !r.safariFrontmost && !r.unsuppressedWebKit;
+    } catch (_) {
+      return null;
+    }
+  })().then((value) => {
+    appState = { at: Date.now(), value, pending: null };
+    return value;
+  });
+  return appState.pending;
+}
+
 ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message !== 'object') return false;
 
@@ -121,6 +146,11 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
     fetchImageBytes(String(message.url || ''))
       .then((r) => sendResponse({ ok: true, ...r }))
       .catch((err) => sendResponse({ ok: false, error: String(err && err.message ? err.message : err) }));
+    return true;
+  }
+
+  if (message.type === 'TRUEHDR_APP_STATE') {
+    queryAppInactive().then((inactive) => sendResponse({ inactive }));
     return true;
   }
 

@@ -1404,6 +1404,27 @@
     window.postMessage({ channel: CHANNEL, from: 'engine', kind, payload }, '*');
   }
 
+  // Background-app EDR limit. While Safari is not the frontmost app, stock WebKit lowers the
+  // screen headroom it reports to every web/GPU process to 1.6x (WebProcessPool::
+  // applyEDRSuppressionIfNeeded, on NSApplicationShouldBeginSuppressingHighDynamicRange-
+  // ContentNotification); canvas, <img> and <video> are all capped and nothing on the page can
+  // exceed it (measured with dev/focus-test on Safari 27.3). A curve rendered for 6x then
+  // hard-clips every highlight flat at 1.6x, so it is refitted to roll off into the limit.
+  // Another Safari window being key keeps full headroom, so page focus alone is not enough: the
+  // bridge asks the native app whether Safari is frontmost and whether the clamp is lifted
+  // (tools/edr-unsuppress with SIP off, or a patched WebKit).
+  const SUPPRESSED_HEADROOM = 1.6;
+  let appInactive = false;
+
+  function currentTone() {
+    const peak = settings.peakBoost;
+    if (!appInactive || !(peak > SUPPRESSED_HEADROOM)) {
+      return [peak, settings.threshold, settings.localPunch, settings.gamutBoost];
+    }
+    const k = (SUPPRESSED_HEADROOM - 1) / (peak - 1);
+    return [SUPPRESSED_HEADROOM, settings.threshold, settings.localPunch * k, settings.gamutBoost];
+  }
+
   // Listen for dynamic range changes (e.g., moving window between XDR and external SDR monitor)
   try {
     const mq = window.matchMedia('(dynamic-range: high)');
@@ -2271,7 +2292,7 @@
           rect: this.rectUniform,
           outW: this.contentOutW,
           outH: this.contentOutH,
-          tone: [settings.peakBoost, settings.threshold, settings.localPunch, settings.gamutBoost],
+          tone: currentTone(),
           shadowDepth: settings.shadowDepth,
           aplGuard: settings.aplGuard,
           splitPos: settings.splitEnabled ? settings.splitPos : -1.0,
@@ -3121,7 +3142,7 @@
           rect: p.rect,
           outW: p.outW,
           outH: p.outH,
-          tone: [settings.peakBoost, settings.threshold, settings.localPunch, settings.gamutBoost],
+          tone: currentTone(),
           shadowDepth: settings.shadowDepth,
           aplGuard: settings.aplGuard,
           splitPos: settings.splitEnabled ? settings.splitPos : -1.0,
@@ -3446,6 +3467,30 @@
     });
   }
 
+  function setAppInactive(v) {
+    if (v === appInactive) return;
+    appInactive = v;
+    for (const inst of instances.values()) {
+      inst.dirtyRender = true;
+      inst.scheduleRenderOnce();
+    }
+    for (const p of images.values()) p.requestRender();
+  }
+
+  // Focused page => Safari is active (no query). Otherwise ask the bridge; the background caches
+  // the native answer, so many frames polling cost one native round trip per 250 ms at most.
+  function refreshAppState() {
+    if (!instances.size && !images.size) return;
+    if (document.hasFocus()) {
+      setAppInactive(false);
+      return;
+    }
+    postToBridge('QUERY_APP_STATE', {});
+  }
+  window.addEventListener('blur', refreshAppState);
+  window.addEventListener('focus', refreshAppState);
+  setInterval(refreshAppState, 500);
+
   const SHORTCUTS = {
     KeyM: ['TOGGLE_MASTER', () => `TrueHDR: ${!settings.enabled ? 'ON' : 'OFF'}`],
     KeyH: ['TOGGLE_HDR', () => (!settings.hdrEnabled ? `HDR: ON (${settings.peakBoost.toFixed(1)}x EDR)` : 'HDR: OFF')],
@@ -3547,6 +3592,9 @@
         imgFetchPending.delete(payload.id);
         resolve(payload);
       }
+    } else if (data.kind === 'APP_STATE') {
+      const payload = data.payload || {};
+      setAppInactive(!document.hasFocus() && payload.inactive !== false);
     } else if (data.kind === 'RETRY_CORS') {
       for (const inst of instances.values()) {
         if (inst.blockedReason && inst.blockedReason.includes('CORS')) {
