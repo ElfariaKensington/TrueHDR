@@ -48,7 +48,7 @@
       tone: vec4f,   // peakBoost, threshold, localPunch, gamutBoost
       extra: vec4f,  // shadowDepth, aplGuard, splitPos (<0 = off), flags (1 = HDR, 2 = bypass native HDR)
       info: vec4f,   // srcW, srcH, frameSeed, reset
-      res: vec4f,    // resample texture W, H, sharpness, unused
+      res: vec4f,    // resample texture W, H, sharpness, EDR headroom cap (0 = none)
       outp: vec4f,   // content output W, H (canvas px), map uv scale x, y
       stat: vec4f,   // APL alpha up, APL alpha down, map alpha (also text attack), text alpha release
     };
@@ -543,6 +543,19 @@
       let p3Y = lumaP3(hdrP3);
       let satScale = 1.0 + lut.z * (1.0 - textProt * 0.6);
       hdrP3 = max(vec3f(0.0), mix(vec3f(p3Y), hdrP3, satScale));
+
+      // Background Safari: stock WebKit caps page EDR at u.res.w. Keep the focused curve up to a
+      // knee and roll everything above it softly into the cap (scaled by the max channel, so hue
+      // holds) instead of letting the compositor hard-clip highlights flat.
+      let cap = u.res.w;
+      if (cap > 1.0) {
+        let knee = 1.0 + (cap - 1.0) * 0.35;
+        let m = max(hdrP3.r, max(hdrP3.g, hdrP3.b));
+        if (m > knee) {
+          let room = cap - knee;
+          hdrP3 = hdrP3 * ((knee + room * (1.0 - exp((knee - m) / room))) / m);
+        }
+      }
 
       var outP3 = linearToSrgbExt(hdrP3);
       let d1 = ign(fragPos.xy + vec2f(u.info.z * 17.0, 0.0));
@@ -1232,7 +1245,7 @@
       u[10] = p.splitPos;
       u[11] = (p.hdr ? 1 : 0) | (p.bypassNativeHdr ? 2 : 0) | (p.sharpDirect ? 4 : 0);
       u[12] = p.srcW; u[13] = p.srcH; u[14] = p.frameSeed || 0; u[15] = reset ? 1 : 0;
-      u[18] = p.sharpness; u[19] = 0;
+      u[18] = p.sharpness; u[19] = p.headroomCap > 1 ? p.headroomCap : 0;
       u[20] = p.outW; u[21] = p.outH;
       u[22] = p.srcW / (CELL * this.cellsW);
       u[23] = p.srcH / (CELL * this.cellsH);
@@ -1409,21 +1422,14 @@
   // applyEDRSuppressionIfNeeded, on NSApplicationShouldBeginSuppressingHighDynamicRange-
   // ContentNotification); canvas, <img> and <video> are all capped and nothing on the page can
   // exceed it (measured with dev/focus-test on Safari 27.3). A curve rendered for 6x then
-  // hard-clips every highlight flat at 1.6x, so it is refitted to roll off into the limit.
+  // hard-clips every highlight flat at 1.6x, so the final pass keeps the curve below a knee and
+  // rolls the rest softly into the limit (headroomCap -> FrameU res.w).
   // Another Safari window being key keeps full headroom, so page focus alone is not enough: the
   // bridge asks the native app whether Safari is frontmost and whether the clamp is lifted
   // (tools/edr-unsuppress with SIP off, or a patched WebKit).
   const SUPPRESSED_HEADROOM = 1.6;
   let appInactive = false;
 
-  function currentTone() {
-    const peak = settings.peakBoost;
-    if (!appInactive || !(peak > SUPPRESSED_HEADROOM)) {
-      return [peak, settings.threshold, settings.localPunch, settings.gamutBoost];
-    }
-    const k = (SUPPRESSED_HEADROOM - 1) / (peak - 1);
-    return [SUPPRESSED_HEADROOM, settings.threshold, settings.localPunch * k, settings.gamutBoost];
-  }
 
   // Listen for dynamic range changes (e.g., moving window between XDR and external SDR monitor)
   try {
@@ -2292,7 +2298,8 @@
           rect: this.rectUniform,
           outW: this.contentOutW,
           outH: this.contentOutH,
-          tone: currentTone(),
+          tone: [settings.peakBoost, settings.threshold, settings.localPunch, settings.gamutBoost],
+          headroomCap: appInactive ? SUPPRESSED_HEADROOM : 0,
           shadowDepth: settings.shadowDepth,
           aplGuard: settings.aplGuard,
           splitPos: settings.splitEnabled ? settings.splitPos : -1.0,
@@ -3142,7 +3149,8 @@
           rect: p.rect,
           outW: p.outW,
           outH: p.outH,
-          tone: currentTone(),
+          tone: [settings.peakBoost, settings.threshold, settings.localPunch, settings.gamutBoost],
+          headroomCap: appInactive ? SUPPRESSED_HEADROOM : 0,
           shadowDepth: settings.shadowDepth,
           aplGuard: settings.aplGuard,
           splitPos: settings.splitEnabled ? settings.splitPos : -1.0,
