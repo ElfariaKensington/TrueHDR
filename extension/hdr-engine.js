@@ -1338,6 +1338,24 @@
     window.postMessage({ channel: CHANNEL, from: 'engine', kind, payload }, '*');
   }
 
+  function configureHDRCanvasContext(ctx, device, label) {
+    const base = {
+      device,
+      format: 'rgba16float',
+      colorSpace: 'display-p3',
+      alphaMode: 'premultiplied'
+    };
+    try {
+      ctx.configure({ ...base, toneMapping: { mode: 'extended' } });
+    } catch (err) {
+      try {
+        ctx.configure(base);
+      } catch (fallbackErr) {
+        console.warn(`[TrueHDR] ${label} failed:`, fallbackErr || err);
+      }
+    }
+  }
+
   // Listen for dynamic range changes (e.g., moving window between XDR and external SDR monitor)
   try {
     const mq = window.matchMedia('(dynamic-range: high)');
@@ -1781,17 +1799,7 @@
 
     reconfigure() {
       if (!this.ctx || gpuState.status !== 'ready') return;
-      try {
-        this.ctx.configure({
-          device: gpuState.device,
-          format: 'rgba16float',
-          colorSpace: 'display-p3',
-          toneMapping: { mode: 'extended' },
-          alphaMode: 'premultiplied'
-        });
-      } catch (err) {
-        console.warn('[TrueHDR] Context configure failed:', err);
-      }
+      configureHDRCanvasContext(this.ctx, gpuState.device, 'Context configure');
     }
 
     checkVideoMetadata() {
@@ -2731,17 +2739,7 @@
     configure() {
       if (!this.ctx && this.canvas) this.ctx = this.canvas.getContext('webgpu');
       if (!this.ctx || !this.core) return;
-      try {
-        this.ctx.configure({
-          device: this.core.device,
-          format: 'rgba16float',
-          colorSpace: 'display-p3',
-          toneMapping: { mode: 'extended' },
-          alphaMode: 'premultiplied'
-        });
-      } catch (err) {
-        console.warn('[TrueHDR] Image context configure failed:', err);
-      }
+      configureHDRCanvasContext(this.ctx, this.core.device, 'Image context configure');
     }
 
     activate() {

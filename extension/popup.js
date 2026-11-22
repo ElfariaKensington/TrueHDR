@@ -220,7 +220,7 @@ function renderStatus(status) {
   if (!status.hasWebGPU) {
     badge.classList.add('badge-warn');
     badge.textContent = 'No WebGPU';
-    detail.textContent = 'Enable WebGPU in Safari settings';
+    detail.textContent = 'Enable WebGPU / hardware acceleration in Chrome settings';
     return;
   }
 

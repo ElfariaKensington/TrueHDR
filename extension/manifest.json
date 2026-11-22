@@ -2,7 +2,8 @@
   "manifest_version": 3,
   "name": "TrueHDR",
   "version": "1.0.0",
-  "description": "True hardware EDR/HDR inverse tone-mapping for YouTube and web videos in Safari using WebGPU float16 extended-range rendering.",
+  "description": "True hardware EDR/HDR inverse tone-mapping and AI super-resolution for YouTube and web videos in Chrome using WebGPU float16 extended-range rendering.",
+  "minimum_chrome_version": "128",
   "icons": {
     "16": "icons/icon-16.png",
     "32": "icons/icon-32.png",
@@ -34,6 +35,13 @@
     }
   },
   "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["sr-models.js", "sr-runtime.js", "hdr-engine.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    },
     {
       "matches": ["<all_urls>"],
       "js": ["content-bridge.js"],

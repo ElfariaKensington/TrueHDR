@@ -41,34 +41,11 @@ function migrateSettings(raw) {
 const tabStates = new Map();
 
 // MAIN-world engine: model weights, then SR runtime, then the engine (order matters).
+// Declared statically with world: "MAIN" in manifest.json for synchronous document_start injection;
+// TRUEHDR_INJECT_MAIN below serves as a fallback for frames injected dynamically.
 const MAIN_WORLD_FILES = ['sr-models.js', 'sr-runtime.js', 'hdr-engine.js'];
-const MAIN_SCRIPT = {
-  id: 'truehdr-main',
-  matches: ['<all_urls>'],
-  js: MAIN_WORLD_FILES,
-  runAt: 'document_start',
-  allFrames: true,
-  world: 'MAIN'
-};
-
-async function ensureMainWorldScriptRegistered() {
-  if (!ext.scripting || !ext.scripting.registerContentScripts) return;
-  try {
-    const existing = await ext.scripting.getRegisteredContentScripts({ ids: [MAIN_SCRIPT.id] });
-    if (existing && existing.length > 0) {
-      // Registrations persist across updates: replace one with an outdated file list.
-      const js = existing[0].js || [];
-      if (js.length === MAIN_WORLD_FILES.length && js.every((f, i) => f === MAIN_WORLD_FILES[i])) return;
-      await ext.scripting.unregisterContentScripts({ ids: [MAIN_SCRIPT.id] });
-    }
-    await ext.scripting.registerContentScripts([MAIN_SCRIPT]);
-  } catch (err) {
-    console.warn('[TrueHDR] registerContentScripts fallback:', err);
-  }
-}
 
 ext.runtime.onInstalled.addListener(async () => {
-  await ensureMainWorldScriptRegistered();
   try {
     const existing = await ext.storage.local.get('truehdrSettings');
     const stored = existing && existing.truehdrSettings;
@@ -79,14 +56,6 @@ ext.runtime.onInstalled.addListener(async () => {
     console.warn('[TrueHDR] Failed to initialize settings:', err);
   }
 });
-
-if (ext.runtime.onStartup) {
-  ext.runtime.onStartup.addListener(() => {
-    ensureMainWorldScriptRegistered();
-  });
-}
-
-ensureMainWorldScriptRegistered();
 
 ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message !== 'object') return false;
