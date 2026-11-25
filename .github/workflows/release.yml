@@ -137,7 +137,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          FLAGS=(--generate-notes --title "${{ needs.meta.outputs.title }}" --target "${{ github.sha }}")
+          FLAGS=(-R "${{ github.repository }}" --generate-notes --title "${{ needs.meta.outputs.title }}" --target "${{ github.sha }}")
           if [ "${{ inputs.prerelease }}" = "true" ]; then
             FLAGS+=(--prerelease)
           fi
