@@ -1,0 +1,134 @@
+name: TrueHDR
+options:
+  bundleIdPrefix: com.elfaria
+  defaultConfig: Release
+  deploymentTarget:
+    macOS: "12.0"
+configs:
+  Debug: debug
+  Release: release
+settings:
+  base:
+    ALWAYS_SEARCH_USER_PATHS: "NO"
+    CLANG_CXX_LANGUAGE_STANDARD: "gnu++20"
+    CLANG_ENABLE_MODULES: "YES"
+    CLANG_ENABLE_OBJC_ARC: "YES"
+    CLANG_ENABLE_OBJC_WEAK: "YES"
+    COPY_PHASE_STRIP: "NO"
+    ENABLE_USER_SCRIPT_SANDBOXING: "YES"
+    GCC_C_LANGUAGE_STANDARD: "gnu17"
+    LOCALIZATION_PREFERS_STRING_CATALOGS: "YES"
+    MACOSX_DEPLOYMENT_TARGET: "12.0"
+    MTL_FAST_MATH: "YES"
+    SDKROOT: macosx
+    SWIFT_VERSION: "5.0"
+  configs:
+    Debug:
+      DEBUG_INFORMATION_FORMAT: dwarf
+      GCC_OPTIMIZATION_LEVEL: "0"
+      ONLY_ACTIVE_ARCH: "YES"
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: "DEBUG $(inherited)"
+      SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+    Release:
+      DEBUG_INFORMATION_FORMAT: dwarf-with-dsym
+      ENABLE_NS_ASSERTIONS: "NO"
+      SWIFT_COMPILATION_MODE: wholemodule
+schemes:
+  TrueHDR:
+    build:
+      targets:
+        TrueHDR: all
+        TrueHDR Extension: all
+targets:
+  TrueHDR:
+    type: application
+    platform: macOS
+    sources:
+      - path: TrueHDR/AppDelegate.swift
+      - path: TrueHDR/ViewController.swift
+      - path: TrueHDR/Base.lproj/Main.storyboard
+      - path: TrueHDR/Assets.xcassets
+      - path: TrueHDR/Resources/Base.lproj/Main.html
+      - path: TrueHDR/Resources/Icon.png
+      - path: TrueHDR/Resources/Style.css
+      - path: TrueHDR/Resources/Script.js
+    dependencies:
+      - target: TrueHDR Extension
+        embed: true
+    settings:
+      base:
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        COMBINE_HIDPI_IMAGES: "YES"
+        CURRENT_PROJECT_VERSION: "1"
+        ENABLE_APP_SANDBOX: "YES"
+        ENABLE_HARDENED_RUNTIME: "YES"
+        ENABLE_OUTGOING_NETWORK_CONNECTIONS: "YES"
+        ENABLE_USER_SELECTED_FILES: readonly
+        GENERATE_INFOPLIST_FILE: "YES"
+        INFOPLIST_FILE: TrueHDR/Info.plist
+        INFOPLIST_KEY_CFBundleDisplayName: TrueHDR
+        INFOPLIST_KEY_NSHumanReadableCopyright: ""
+        INFOPLIST_KEY_NSMainStoryboardFile: Main
+        INFOPLIST_KEY_NSPrincipalClass: NSApplication
+        INFOPLIST_KEY_NSViewGestureRecognizerIsExclusive: "NO"
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/../Frameworks"
+        MARKETING_VERSION: "1.0"
+        OTHER_LDFLAGS:
+          - "-framework"
+          - SafariServices
+          - "-framework"
+          - WebKit
+        PRODUCT_BUNDLE_IDENTIFIER: com.elfaria.TrueHDR
+        PRODUCT_NAME: "$(TARGET_NAME)"
+        REGISTER_APP_GROUPS: "YES"
+  TrueHDR Extension:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: TrueHDR Extension/SafariWebExtensionHandler.swift
+      - path: ../../extension/content-bridge.js
+        buildPhase: resources
+      - path: ../../extension/popup.js
+        buildPhase: resources
+      - path: ../../extension/background.js
+        buildPhase: resources
+      - path: ../../extension/popup.html
+        buildPhase: resources
+      - path: ../../extension/icons
+        type: folder
+        buildPhase: resources
+      - path: ../../extension/manifest.json
+        buildPhase: resources
+      - path: ../../extension/hdr-engine.js
+        buildPhase: resources
+      - path: ../../extension/sr-runtime.js
+        buildPhase: resources
+      - path: ../../extension/sr-models.js
+        buildPhase: resources
+      - path: ../../extension/popup.css
+        buildPhase: resources
+    settings:
+      base:
+        CURRENT_PROJECT_VERSION: "1"
+        ENABLE_APP_SANDBOX: "YES"
+        ENABLE_HARDENED_RUNTIME: "YES"
+        ENABLE_USER_SELECTED_FILES: readonly
+        GENERATE_INFOPLIST_FILE: "YES"
+        INFOPLIST_FILE: TrueHDR Extension/Info.plist
+        INFOPLIST_KEY_CFBundleDisplayName: TrueHDR Extension
+        INFOPLIST_KEY_NSHumanReadableCopyright: ""
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/../Frameworks"
+          - "@executable_path/../../../../Frameworks"
+        MACOSX_DEPLOYMENT_TARGET: "12.0"
+        MARKETING_VERSION: "1.0"
+        OTHER_LDFLAGS:
+          - "-framework"
+          - SafariServices
+        PRODUCT_BUNDLE_IDENTIFIER: com.elfaria.TrueHDR.Extension
+        PRODUCT_NAME: "$(TARGET_NAME)"
+        SKIP_INSTALL: "YES"

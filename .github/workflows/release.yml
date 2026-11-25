@@ -67,6 +67,13 @@ jobs:
       - name: Checkout safari branch
         uses: actions/checkout@v4
 
+      - name: Generate project.pbxproj for Xcode 26
+        if: ${{ !hashFiles('xcode/TrueHDR/TrueHDR.xcodeproj/project.pbxproj') }}
+        run: |
+          command -v xcodegen >/dev/null || brew install xcodegen
+          rm -f xcode/TrueHDR/TrueHDR.xcodeproj/project.xcproj
+          xcodegen generate --spec xcode/TrueHDR/project.yml --project xcode/TrueHDR
+
       - name: Build TrueHDR (Release)
         run: |
           xcodebuild \
