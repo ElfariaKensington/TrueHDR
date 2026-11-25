@@ -28,8 +28,11 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    runs-on: macos-latest
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      title: ${{ steps.resolve.outputs.title }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,7 +40,7 @@ jobs:
           fetch-depth: 0
 
       - name: Generate tag and release name
-        id: meta
+        id: resolve
         run: |
           BASE_VER=$(python3 -c "import json; print(json.load(open('extension/manifest.json'))['version'])")
           TAG="${{ inputs.tag }}"
@@ -51,11 +54,18 @@ jobs:
           fi
           TITLE="${{ inputs.release_name }}"
           if [ -z "$TITLE" ]; then
-            TITLE="TrueHDR ${TAG} (macOS Safari)"
+            TITLE="TrueHDR ${TAG} (Safari & Chrome)"
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "title=$TITLE" >> "$GITHUB_OUTPUT"
           echo "Resolved tag=$TAG title=$TITLE"
+
+  build-safari:
+    needs: meta
+    runs-on: macos-latest
+    steps:
+      - name: Checkout safari branch
+        uses: actions/checkout@v4
 
       - name: Build TrueHDR (Release)
         run: |
@@ -68,28 +78,60 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             build
 
-      - name: Package app
+      - name: Package Safari app
         run: |
-          ZIP="TrueHDR-${{ steps.meta.outputs.tag }}-macOS.zip"
+          ZIP="TrueHDR-${{ needs.meta.outputs.tag }}-Safari-macOS.zip"
           ditto -c -k --sequesterRsrc --keepParent \
             build/Build/Products/Release/TrueHDR.app \
             "$ZIP"
           shasum -a 256 "$ZIP"
-          echo "zip=$ZIP" >> "$GITHUB_ENV"
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
 
-      - name: Upload build artifact
+      - name: Upload Safari artifact
         uses: actions/upload-artifact@v4
         with:
-          name: TrueHDR-${{ steps.meta.outputs.tag }}-macOS
+          name: TrueHDR-${{ needs.meta.outputs.tag }}-Safari-macOS
           path: ${{ env.ZIP }}
 
+  build-chrome:
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout chrome branch
+        uses: actions/checkout@v4
+        with:
+          ref: chrome
+
+      - name: Package Chrome extension
+        run: |
+          ZIP="TrueHDR-${{ needs.meta.outputs.tag }}-Chrome.zip"
+          (cd extension && zip -r "../$ZIP" . -x '*.DS_Store')
+          sha256sum "$ZIP"
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+
+      - name: Upload Chrome artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrueHDR-${{ needs.meta.outputs.tag }}-Chrome
+          path: ${{ env.ZIP }}
+
+  release:
+    needs: [meta, build-safari, build-chrome]
+    if: ${{ inputs.create_release }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
       - name: Create GitHub Release
-        if: ${{ inputs.create_release }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          FLAGS=(--generate-notes --title "${{ steps.meta.outputs.title }}" --target "${{ github.sha }}")
+          FLAGS=(--generate-notes --title "${{ needs.meta.outputs.title }}" --target "${{ github.sha }}")
           if [ "${{ inputs.prerelease }}" = "true" ]; then
             FLAGS+=(--prerelease)
           fi
-          gh release create "${{ steps.meta.outputs.tag }}" "${{ env.ZIP }}" "${FLAGS[@]}"
+          gh release create "${{ needs.meta.outputs.tag }}" dist/*.zip "${FLAGS[@]}"
