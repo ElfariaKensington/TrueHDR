@@ -140,7 +140,6 @@
         let base = vec2f(gid.xy) * 8.0 + vec2f(1.0);
         let mxp = dims - vec2i(1);
         var q: array<f32, 16>;
-        var pv: array<f32, 16>;
         var sumY = 0.0;
         var hdr = 0.0;
         for (var i = 0; i < 16; i = i + 1) {
@@ -154,15 +153,6 @@
           sumY = sumY + Y;
           hdr = hdr + select(0.0, 1.0, mx > 1.05);
           q[i] = log2(max(mix(Y, max(lin.r, max(lin.g, lin.b)), 0.46), 1.0 / 16384.0));
-          pv[i] = mix(luma709(raw), mx, 0.46);
-        }
-        // Strong perceptual transitions between neighbouring quads (24 pairs)
-        var edges = 0.0;
-        for (var r = 0; r < 4; r = r + 1) {
-          for (var c = 0; c < 3; c = c + 1) {
-            edges = edges + step(0.22, abs(pv[r * 4 + c] - pv[r * 4 + c + 1]));
-            edges = edges + step(0.22, abs(pv[c * 4 + r] - pv[c * 4 + r + 4]));
-          }
         }
         // Robust cell level: median of the four 4x4-pixel group medians (median-of-4 = mean of the
         // middle two). Rejects small objects (birds, specks) whatever their contrast.
@@ -171,7 +161,7 @@
         let g2 = med4(q[8], q[9], q[12], q[13]);
         let g3 = med4(q[10], q[11], q[14], q[15]);
         let cellY = sumY / 16.0;
-        textureStore(cellOut, vec2i(gid.xy), vec4f(cellY, med4(g0, g1, g2, g3), edges / 24.0, hdr / 16.0));
+        textureStore(cellOut, vec2i(gid.xy), vec4f(cellY, med4(g0, g1, g2, g3), 0.0, hdr / 16.0));
         atomicAdd(&wHist[min(u32(pow(cellY, 1.0 / 2.2) * 32.0), 31u)], 1u);
         atomicAdd(&wAcc[0], u32(round(min(cellY, 16.0) * 1024.0)));
         atomicAdd(&wAcc[1], u32(round(hdr * 64.0)));
@@ -303,7 +293,6 @@
     @group(0) @binding(4) var<uniform> u: FrameU;
 
     var<workgroup> tM: array<f32, 140>;
-    var<workgroup> tD: array<f32, 140>;
 
     fn cs(a: ptr<function, f32>, b: ptr<function, f32>) {
       let lo = min(*a, *b);
@@ -342,7 +331,6 @@
       for (var k = li; k < 140u; k = k + 64u) {
         let t = textureLoad(cellTex, clamp(origin + vec2i(i32(k % 14u), i32(k / 14u)), vec2i(0), mxc), 0);
         tM[k] = t.y;
-        tD[k] = t.z;
       }
       workgroupBarrier();
       let c = vec2i(wid.xy) * 8 + vec2i(lid.xy);
@@ -355,11 +343,13 @@
       // Median of the 3x3 cell levels rejects objects spanning up to ~2x2 cells; then a
       // range-weighted mean around it keeps the map smooth.
       let med = median9(m0, m1, m2, m3, m4, m5, m6, m7, m8);
-      let wc = rw(m0, med) * 0.5 + rw(m2, med) * 0.5 + rw(m6, med) * 0.5 + rw(m8, med) * 0.5;
-      let we = rw(m1, med) * 0.7 + rw(m3, med) * 0.7 + rw(m5, med) * 0.7 + rw(m7, med) * 0.7;
+      let r0 = rw(m0, med); let r2 = rw(m2, med); let r6 = rw(m6, med); let r8 = rw(m8, med);
+      let r1 = rw(m1, med); let r3 = rw(m3, med); let r5 = rw(m5, med); let r7 = rw(m7, med);
       let w4 = rw(m4, med);
-      let bsum = (rw(m0, med) * m0 + rw(m2, med) * m2 + rw(m6, med) * m6 + rw(m8, med) * m8) * 0.5
-               + (rw(m1, med) * m1 + rw(m3, med) * m3 + rw(m5, med) * m5 + rw(m7, med) * m7) * 0.7
+      let wc = (r0 + r2 + r6 + r8) * 0.5;
+      let we = (r1 + r3 + r5 + r7) * 0.7;
+      let bsum = (r0 * m0 + r2 * m2 + r6 * m6 + r8 * m8) * 0.5
+               + (r1 * m1 + r3 * m3 + r5 * m5 + r7 * m7) * 0.7
                + w4 * m4;
       // Use the brighter of the range-weighted median and 4-neighbor max so dark objects/text
       // never drag down the background reference and create white halos on adjacent light pixels.
@@ -425,7 +415,7 @@
 
     // Edge-aware slice of the 1/8-res map: 2x2 joint-bilateral weights pick the cells whose
     // background level matches this pixel, so large edges never bleed across (halo-free).
-    fn sliceMap(vuv: vec2f, L: f32) -> vec2f {
+    fn sliceMap(vuv: vec2f, L: f32) -> f32 {
       let muv = vuv * u.outp.zw;
       let g = textureGather(0, mapTex, samp, muv);
       let f = fract(muv * vec2f(textureDimensions(mapTex)) - vec2f(0.5));
@@ -436,9 +426,7 @@
       let k = select(vec4f(0.85), vec4f(1.35), d > vec4f(0.0));
       let x = max(vec4f(1.0) - k * d * d, vec4f(0.0));
       let w = bw * (x * x + vec4f(1e-4));
-      let B = dot(w, g) / max(dot(w, vec4f(1.0)), 1e-6);
-      let t = textureSampleLevel(mapTex, samp, muv, 0.0).y;
-      return vec2f(B, t);
+      return dot(w, g) / max(dot(w, vec4f(1.0)), 1e-6);
     }
 
     fn toneMapHDR(c0: vec3f, vuv: vec2f, fragPos: vec4f) -> vec4f {
@@ -450,15 +438,12 @@
       let lut = textureSampleLevel(lutTex, samp, vec2f((L - (${LUT_L0.toFixed(1)})) * ${(1 / (LUT_L1 - LUT_L0)).toFixed(8)}, 0.5), 0.0);
 
       // Pixel vs. local background (same map at source scale for every output path)
-      let loc = sliceMap(vuv, L);
-      let bg = exp2(loc.x);
+      let bg = exp2(sliceMap(vuv, L));
       let detail = max(0.0, E - bg * 1.15);
-      // Text protection only for pixels well above their background inside text-dense regions
-      let textProt = clamp(loc.y, 0.0, 1.0) * smoothstep(0.10, 0.32, detail);
 
       // Deep-black-only shadow floor (< 0.015 linear), kept gentle to avoid dark silhouette crush
       var shadowRatio = 1.0;
-      if (maxIn < 0.015) {
+      if (maxIn < 0.015 && u.extra.x > 0.001) {
         let blackToe = pow(max(maxIn, 1e-5), u.extra.x * 0.25);
         let blackMix = 1.0 - smoothstep(0.002, 0.015, maxIn);
         shadowRatio = mix(1.0, clamp(blackToe, 0.86, 1.0), blackMix);
@@ -468,14 +453,12 @@
       var hdrGain = lut.x;
 
       // Local specular punch: only genuine bright local highlights above background
-      let localMask = smoothstep(0.08, 0.32, detail) * lut.y * (1.0 - textProt * 0.85);
+      let localMask = smoothstep(0.08, 0.32, detail) * lut.y;
       hdrGain = hdrGain * (1.0 + u.tone.z * 0.50 * localMask);
-
-      hdrGain = mix(hdrGain, min(hdrGain, scene.v.w), textProt * 0.85);
 
       var hdrP3 = p3Linear * (hdrGain * shadowRatio);
       let p3Y = lumaP3(hdrP3);
-      let satScale = 1.0 + lut.z * (1.0 - textProt * 0.6);
+      let satScale = 1.0 + lut.z;
       hdrP3 = max(vec3f(0.0), mix(vec3f(p3Y), hdrP3, satScale));
 
       var outP3 = linearToSrgbExt(hdrP3);
@@ -1246,14 +1229,14 @@
       u[17] = resH;
       d.queue.writeBuffer(this.frameU, 0, u);
 
-      const fpTS = tsQS ? {
+      const fpTS = tsQS && ((!wroteBegin && tsBegin !== undefined) || tsEnd !== undefined) ? {
         querySet: tsQS,
         ...(!wroteBegin && tsBegin !== undefined ? { beginningOfPassWriteIndex: tsBegin } : {}),
         ...(tsEnd !== undefined ? { endOfPassWriteIndex: tsEnd } : {})
       } : null;
       const fp = encoder.beginRenderPass({
         colorAttachments: [{ view: targetView, loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
-        ...(fpTS && Object.keys(fpTS).length ? { timestampWrites: fpTS } : {})
+        ...(fpTS ? { timestampWrites: fpTS } : {})
       });
       fp.setPipeline(pipe);
       fp.setBindGroup(0, videoBG);
@@ -1453,11 +1436,65 @@
     }, 1500);
   }
 
+  function getDecodedFrameCount(video) {
+    if (typeof video.getVideoPlaybackQuality === 'function') {
+      const q = video.getVideoPlaybackQuality();
+      if (q && typeof q.totalVideoFrames === 'number') return q.totalVideoFrames;
+    }
+    if (typeof video.webkitDecodedFrameCount === 'number') {
+      return video.webkitDecodedFrameCount;
+    }
+    return -1;
+  }
+
+  function findContainingBlock(el) {
+    const op = el.offsetParent;
+    for (let p = el.parentElement; p && p !== op && p !== document.body && p !== document.documentElement; p = p.parentElement) {
+      const cs = getComputedStyle(p);
+      if (
+        (cs.transform && cs.transform !== 'none') ||
+        (cs.perspective && cs.perspective !== 'none') ||
+        (cs.filter && cs.filter !== 'none') ||
+        (cs.contain && (cs.contain.includes('layout') || cs.contain.includes('paint') || cs.contain === 'strict' || cs.contain === 'content'))
+      ) {
+        return p;
+      }
+    }
+    return op || document.documentElement;
+  }
+
+  function computeOverlayBox(targetRect, canvas) {
+    const cb = findContainingBlock(canvas);
+    const isDocRoot =
+      cb === document.documentElement ||
+      (cb === document.body && getComputedStyle(cb).position === 'static');
+    if (isDocRoot) {
+      return {
+        cb,
+        left: targetRect.left + window.scrollX,
+        top: targetRect.top + window.scrollY,
+        cssW: targetRect.width,
+        cssH: targetRect.height
+      };
+    }
+    const cbRect = cb.getBoundingClientRect();
+    const sx = cb.offsetWidth > 0 ? cbRect.width / cb.offsetWidth : 1;
+    const sy = cb.offsetHeight > 0 ? cbRect.height / cb.offsetHeight : 1;
+    return {
+      cb,
+      left: (targetRect.left - cbRect.left) / sx - cb.clientLeft + cb.scrollLeft,
+      top: (targetRect.top - cbRect.top) / sy - cb.clientTop + cb.scrollTop,
+      cssW: targetRect.width / sx,
+      cssH: targetRect.height / sy
+    };
+  }
+
   class VideoHDRProcessor {
     constructor(video) {
       this.video = video;
       this.canvas = null;
       this.ctx = null;
+      this.splitHandle = null;
       this.renderer = null;
       this.upscalingActive = false;
       this.resetStateNextFrame = true;
@@ -1469,6 +1506,9 @@
       this.cachedBoxW = 0;
       this.cachedBoxH = 0;
       this.lastLayoutCheckMs = 0;
+      this.settleUntilMs = performance.now() + 1500;
+      this.hasPresentedFrame = false;
+      this.initPromise = null;
 
       this.isVisible = !document.hidden;
       this.isActive = false;
@@ -1478,6 +1518,8 @@
       this.frameSeed = 0;
       this.frameCounter = 0;
       this.lastRenderedTime = -1;
+      this.lastDecodedFrames = -1;
+      this.decodedCounterWorks = false;
       this.dirtyRender = true;
       this.lastRectKey = '';
       this.configuredWidth = 0;
@@ -1508,18 +1550,19 @@
       this.lastVfcNow = 0;
 
       this.boundOnFrame = this.onVideoFrame.bind(this);
-      this.boundSchedule = this.scheduleLoop.bind(this);
-      this.boundRenderOnce = this.scheduleRenderOnce.bind(this);
+      this.boundSchedule = this.onPlayOrReady.bind(this);
+      this.boundRenderOnce = this.onPauseOrSeek.bind(this);
       this.boundCheckMeta = this.checkVideoMetadata.bind(this);
       this.boundTimeUpdate = this.onTimeUpdate.bind(this);
 
       this.setupObservers();
       this.attachEvents();
-      this.initResources();
+      this.maybeInitResources();
     }
 
     setupObservers() {
       this.resizeObserver = new ResizeObserver(() => {
+        this.settleUntilMs = Math.max(this.settleUntilMs, performance.now() + 1000);
         if (this.syncOverlayLayout(true)) {
           this.dirtyRender = true;
           this.scheduleRenderOnce();
@@ -1530,12 +1573,23 @@
         this.resizeObserver.observe(this.video.parentElement);
       }
 
+      this.attrObserver = new MutationObserver(() => {
+        if (this.destroyed || !this.canvas) return;
+        this.lastLayoutCheckMs = 0;
+        if (this.syncOverlayLayout(true)) {
+          this.dirtyRender = true;
+          this.scheduleRenderOnce();
+        }
+      });
+      this.attrObserver.observe(this.video, { attributes: true, attributeFilter: ['style', 'class'] });
+
       this.intersectionObserver = new IntersectionObserver(
         (entries) => {
           for (const entry of entries) {
             this.isVisible = entry.isIntersecting;
           }
           if (this.isVisible && !document.hidden) {
+            this.maybeInitResources();
             this.dirtyRender = true;
             this.scheduleLoop();
             this.scheduleRenderOnce();
@@ -1561,9 +1615,24 @@
       this.video.addEventListener('encrypted', this.boundCheckMeta);
     }
 
+    onPlayOrReady() {
+      if (this.destroyed) return;
+      this.maybeInitResources();
+      this.scheduleLoop();
+    }
+
+    onPauseOrSeek() {
+      if (this.destroyed) return;
+      this.lastDecodedFrames = -1;
+      this.dirtyRender = true;
+      this.maybeInitResources();
+      this.scheduleRenderOnce();
+    }
+
     onTimeUpdate() {
       // Watchdog: if rVFC stalled during a seek/tab switch, kick loop back on
       if (!this.destroyed && this.isVisible && settings.effectiveEnabled && !this.video.paused && !this.video.ended) {
+        this.maybeInitResources();
         if (this.rvfcId === null) {
           this.scheduleLoop();
           this.scheduleRenderOnce();
@@ -1571,25 +1640,42 @@
       }
     }
 
+    maybeInitResources() {
+      if (this.destroyed || this.renderer || this.initPromise) return;
+      if (!settings.effectiveEnabled || !this.isVisible) return;
+      if (this.video.readyState < 1 && this.video.paused) return;
+      this.initResources();
+    }
+
     async initResources() {
-      const gpu = await ensureGPU();
-      if (!gpu || this.destroyed) {
-        if (gpuState.errorMsg) {
-          this.blockedReason = gpuState.errorMsg;
-          broadcastStatus();
+      if (this.initPromise) return this.initPromise;
+      const run = (async () => {
+        const gpu = await ensureGPU();
+        if (!gpu || this.destroyed) {
+          if (gpuState.errorMsg) {
+            this.blockedReason = gpuState.errorMsg;
+            broadcastStatus();
+          }
+          return;
         }
-        return;
-      }
 
-      if (!this.renderer) {
-        this.renderer = new FrameRenderer(gpu.core);
-        this.renderer.enableTimestamps();
-      }
+        if (!this.renderer) {
+          this.renderer = new FrameRenderer(gpu.core);
+        }
 
-      this.ensureCanvas();
-      this.checkVideoMetadata();
-      this.syncOverlayLayout(true);
-      this.scheduleLoop();
+        this.ensureCanvas();
+        this.checkVideoMetadata();
+        this.syncOverlayLayout(true);
+        if (!this.video.paused && !this.video.ended) {
+          this.scheduleLoop();
+        } else {
+          this.scheduleRenderOnce();
+        }
+      })();
+      this.initPromise = run.finally(() => {
+        if (this.initPromise === run) this.initPromise = null;
+      });
+      return this.initPromise;
     }
 
     onDeviceLost() {
@@ -1650,7 +1736,8 @@
         padding: '0',
         border: '0',
         background: 'transparent',
-        display: 'none'
+        display: 'none',
+        visibility: 'hidden'
       });
       canvas.style.setProperty('pointer-events', 'none', 'important');
       canvas.style.setProperty('touch-action', 'none', 'important');
@@ -1754,7 +1841,7 @@
     syncSplitHandle() {
       const h = this.splitHandle;
       if (!h || !this.canvas) return;
-      if (!settings.splitEnabled || this.canvas.style.display === 'none' || !this.shouldRender()) {
+      if (!settings.splitEnabled || this.canvas.style.display === 'none' || this.canvas.style.visibility === 'hidden' || !this.shouldRender()) {
         if (h.style.display !== 'none') h.style.display = 'none';
         return;
       }
@@ -1819,9 +1906,14 @@
 
       this.resetStateNextFrame = true;
       this.dirtyRender = true;
+      this.lastDecodedFrames = -1;
+      this.settleUntilMs = Math.max(this.settleUntilMs, performance.now() + 1500);
       this.resetSRGuard();
-      this.syncOverlayLayout(true);
-      this.scheduleRenderOnce();
+      this.maybeInitResources();
+      if (this.renderer) {
+        this.syncOverlayLayout(true);
+        this.scheduleRenderOnce();
+      }
       broadcastStatus();
     }
 
@@ -1904,61 +1996,51 @@
       };
     }
 
+    hideOverlay() {
+      if (this.canvas) {
+        if (this.canvas.style.display !== 'none') this.canvas.style.display = 'none';
+        if (this.canvas.style.visibility !== 'hidden') this.canvas.style.visibility = 'hidden';
+      }
+      this.hasPresentedFrame = false;
+      this.syncSplitHandle();
+      if (this.isActive) {
+        this.isActive = false;
+        broadcastStatus();
+      }
+    }
+
     syncOverlayLayout(force = false) {
       if (!this.video.isConnected) {
         this.destroy();
         return false;
       }
       const now = performance.now();
-      if (!force && (now - this.lastLayoutCheckMs) < 1000 && this.canvas && this.canvas.parentElement === this.video.parentElement && this.configuredWidth > 0) {
+      const settling = now < this.settleUntilMs;
+      if (!force && !settling && (now - this.lastLayoutCheckMs) < 1000 && this.canvas && this.canvas.parentElement === this.video.parentElement && this.configuredWidth > 0) {
         return false;
       }
       this.lastLayoutCheckMs = now;
 
+      if (!this.shouldRender()) {
+        this.hideOverlay();
+        return false;
+      }
+
       if (!this.canvas) {
+        if (!this.renderer) return false;
         this.ensureCanvas();
       }
       if (!this.canvas) return false;
 
       if (this.video.parentElement && this.canvas.parentElement !== this.video.parentElement) {
         this.video.insertAdjacentElement('afterend', this.canvas);
-      }
-
-      if (!this.shouldRender()) {
-        if (this.canvas.style.display !== 'none') {
-          this.canvas.style.display = 'none';
-        }
-        this.syncSplitHandle();
-        if (this.isActive) {
-          this.isActive = false;
-          broadcastStatus();
-        }
-        return false;
+        this.lastRectKey = '';
       }
 
       const vRect = this.video.getBoundingClientRect();
       if (vRect.width < 96 || vRect.height < 64) {
-        if (this.canvas.style.display !== 'none') {
-          this.canvas.style.display = 'none';
-        }
-        this.syncSplitHandle();
-        if (this.isActive) {
-          this.isActive = false;
-          broadcastStatus();
-        }
+        this.hideOverlay();
         return false;
-      }
-
-      const cb = this.canvas.offsetParent || document.documentElement;
-      let left;
-      let top;
-      if (cb === document.documentElement || cb === document.body) {
-        left = vRect.left + window.scrollX;
-        top = vRect.top + window.scrollY;
-      } else {
-        const cbRect = cb.getBoundingClientRect();
-        left = vRect.left - cbRect.left - cb.clientLeft + cb.scrollLeft;
-        top = vRect.top - cbRect.top - cb.clientTop + cb.scrollTop;
       }
 
       const cs = getComputedStyle(this.video);
@@ -1969,20 +2051,48 @@
       this.cachedBoxH = vRect.height;
 
       const plan = this.computeCanvasPlan(vRect.width, vRect.height, rect);
+      const wantHdr = Boolean(settings.effectiveHdr) && !(settings.bypassNativeHdr && this.nativeHdrDetected);
+      const sharpAmt = typeof settings.upscaleSharpness === 'number' ? settings.upscaleSharpness : DEFAULT_SETTINGS.upscaleSharpness;
+      const wantSharpDirect = Boolean(settings.effectiveUpscale) && !(settings.bypassNativeHdr && this.nativeHdrDetected) && sharpAmt > 0;
+      if (!wantHdr && !plan.upscale && !wantSharpDirect) {
+        this.upscalingActive = false;
+        this.hideOverlay();
+        return false;
+      }
+
+      // Ensure the canvas participates in layout before querying offsetParent:
+      // CSSOM returns null for offsetParent while display is 'none', which otherwise
+      // computes document-absolute coordinates inside a positioned player on first open.
+      let shownChanged = false;
+      if (this.canvas.style.display !== 'block') {
+        if (!this.hasPresentedFrame) {
+          this.canvas.style.visibility = 'hidden';
+        }
+        this.canvas.style.display = 'block';
+        shownChanged = true;
+        this.settleUntilMs = Math.max(this.settleUntilMs, now + 1500);
+      }
+
+      const box = computeOverlayBox(vRect, this.canvas);
+      const left = box.left;
+      const top = box.top;
+      const cssW = box.cssW;
+      const cssH = box.cssH;
+
       const cw = plan.cw;
       const ch = plan.ch;
       this.rectUniform = plan.rectUniform;
       this.contentOutW = plan.outW;
       this.contentOutH = plan.outH;
 
-      const rectKey = `${left.toFixed(1)},${top.toFixed(1)},${vRect.width.toFixed(1)},${vRect.height.toFixed(1)},${cw},${ch},${cs.zIndex},${cs.borderRadius},${Boolean(this.video.controls)}`;
+      const rectKey = `${left.toFixed(1)},${top.toFixed(1)},${cssW.toFixed(1)},${cssH.toFixed(1)},${cw},${ch},${cs.zIndex},${cs.borderRadius},${Boolean(this.video.controls)}`;
       const rectChanged = rectKey !== this.lastRectKey;
       if (rectChanged) {
         this.lastRectKey = rectKey;
         this.canvas.style.left = `${left}px`;
         this.canvas.style.top = `${top}px`;
-        this.canvas.style.width = `${vRect.width}px`;
-        this.canvas.style.height = `${vRect.height}px`;
+        this.canvas.style.width = `${cssW}px`;
+        this.canvas.style.height = `${cssH}px`;
         this.canvas.style.zIndex = cs.zIndex;
         this.canvas.style.borderRadius = cs.borderRadius;
         this.canvas.style.clipPath = this.video.controls ? 'inset(0 0 64px 0)' : '';
@@ -2000,11 +2110,6 @@
       const upscalingChanged = this.upscalingActive !== plan.upscale;
       this.upscalingActive = plan.upscale;
 
-      let shownChanged = false;
-      if (this.canvas.style.display !== 'block') {
-        this.canvas.style.display = 'block';
-        shownChanged = true;
-      }
       this.syncSplitHandle();
       if (!this.isActive || upscalingChanged) {
         this.isActive = true;
@@ -2122,11 +2227,11 @@
         return;
       }
       this.syncOverlayLayout(false);
-      if (!this.shouldRender() || !this.ctx || !this.canvas) return;
+      if (!this.shouldRender() || !this.ctx || !this.canvas || this.canvas.style.display === 'none') return;
       if (this.cachedBoxW < 96 || this.cachedBoxH < 64) return;
       if (this.configuredWidth === 0) {
         this.syncOverlayLayout(true);
-        if (this.configuredWidth === 0) return;
+        if (this.configuredWidth === 0 || this.canvas.style.display === 'none') return;
       }
 
       const device = gpuState.device;
@@ -2173,7 +2278,8 @@
       this.resetStateNextFrame = false;
       this.dirtyRender = false;
       const isSr = plan.mode === 'sr';
-      const measure = isSr && (this.gpuMs === null || this.frameCounter < 16 || this.overBudget > 0 || (this.frameCounter & 63) === 0);
+      if (isSr && !this.renderer.ts) this.renderer.enableTimestamps();
+      const measure = isSr && (this.gpuMs === null || this.frameCounter < 16 || this.overBudget > 0 || (this.frameCounter & 127) === 0);
       this.frameCounter++;
 
       const encoder = device.createCommandEncoder();
@@ -2212,6 +2318,13 @@
         return;
       }
       device.queue.submit([encoder.finish()]);
+      if (!this.hasPresentedFrame) {
+        this.hasPresentedFrame = true;
+        if (this.canvas && this.canvas.style.visibility !== 'visible') {
+          this.canvas.style.visibility = 'visible';
+        }
+        this.syncSplitHandle();
+      }
       this.inFlightGpu++;
       const tsPromise = measure ? this.renderer.readTimestamps() : null;
       if (tsPromise) {
@@ -2255,10 +2368,28 @@
       this.rvfcId = null;
       if (this.destroyed || document.hidden || !this.isVisible) return;
       const ct = this.video.currentTime;
+      const fc = getDecodedFrameCount(this.video);
+      if (fc > 0 && this.lastDecodedFrames > 0 && fc !== this.lastDecodedFrames) {
+        this.decodedCounterWorks = true;
+      }
       // Avoid requestVideoFrameCallback in Safari/WebKit: startVideoFrameMetadataGathering
       // forces sync GPU IPC + CPU CVPixelBuffer copies on every frame even when using
-      // zero-copy GPU importExternalTexture().
-      const sameFrame = ct === this.lastRenderedTime && !this.dirtyRender;
+      // zero-copy GPU importExternalTexture(). Use the in-memory decoded frame counter
+      // instead to skip redundant GPU passes when display refresh (60-120 Hz) outpaces
+      // the video frame rate (24-60 fps).
+      let sameFrame = false;
+      if (!this.dirtyRender) {
+        if (ct === this.lastRenderedTime) {
+          sameFrame = true;
+        } else if (
+          fc > 0 &&
+          fc === this.lastDecodedFrames &&
+          (now - this.lastRenderMs) < 120 &&
+          (this.decodedCounterWorks || this.lastRenderMs > 0)
+        ) {
+          sameFrame = true;
+        }
+      }
       if (!sameFrame) {
         if (typeof now === 'number') {
           if (this.lastVfcNow > 0) {
@@ -2268,6 +2399,7 @@
           this.lastVfcNow = now;
         }
         this.lastRenderedTime = ct;
+        if (fc >= 0) this.lastDecodedFrames = fc;
         this.renderFrame();
       }
       if (!this.video.paused && !this.video.ended && this.isVisible && !document.hidden && settings.effectiveEnabled) {
@@ -2325,6 +2457,7 @@
       this.destroyed = true;
       this.stopLoop();
       if (this.resizeObserver) this.resizeObserver.disconnect();
+      if (this.attrObserver) this.attrObserver.disconnect();
       if (this.intersectionObserver) this.intersectionObserver.disconnect();
       this.video.removeEventListener('play', this.boundSchedule);
       this.video.removeEventListener('playing', this.boundSchedule);
@@ -2877,17 +3010,16 @@
       }
       const r = img.getBoundingClientRect();
       if (r.width < IMG_MIN_CSS_W || r.height < IMG_MIN_CSS_H) return false;
-      const cb = canvas.offsetParent || document.documentElement;
-      let left;
-      let top;
-      if (cb === document.documentElement || cb === document.body) {
-        left = r.left + window.scrollX;
-        top = r.top + window.scrollY;
-      } else {
-        const cbRect = cb.getBoundingClientRect();
-        left = r.left - cbRect.left - cb.clientLeft + cb.scrollLeft;
-        top = r.top - cbRect.top - cb.clientTop + cb.scrollTop;
+      if (canvas.style.display === 'none') {
+        canvas.style.visibility = 'hidden';
+        canvas.style.display = 'block';
       }
+      const box = computeOverlayBox(r, canvas);
+      const cb = box.cb;
+      const left = box.left;
+      const top = box.top;
+      const cssW = box.cssW;
+      const cssH = box.cssH;
       // Ancestors between the image and the overlay's containing block may clip the image
       // (overflow) but would not clip an absolutely positioned overlay: replicate as clip-path.
       let cl = r.left;
@@ -2904,7 +3036,11 @@
           cbt = Math.min(cbt, er.bottom);
         }
       }
-      if (cr - cl < 4 || cbt - ct < 4) return false;
+      if (cr - cl < 4 || cbt - ct < 4) {
+        canvas.style.display = 'none';
+        canvas.style.visibility = 'hidden';
+        return false;
+      }
       const clip = [ct - r.top, r.right - cr, r.bottom - cbt, cl - r.left].map((v) => Math.max(0, v));
       const clipCss = clip.some((v) => v > 0.5) ? `inset(${clip.map((v) => `${v.toFixed(1)}px`).join(' ')})` : '';
 
@@ -2926,14 +3062,14 @@
       const sh = Math.max(1, Math.round(outH * ks));
       this.plan = { rect, outW, outH, sw, sh };
 
-      const key = `${left.toFixed(1)},${top.toFixed(1)},${r.width.toFixed(1)},${r.height.toFixed(1)},${cw},${ch},${cs.zIndex},${cs.borderRadius},${clipCss},${rect.join(',')}`;
+      const key = `${left.toFixed(1)},${top.toFixed(1)},${cssW.toFixed(1)},${cssH.toFixed(1)},${cw},${ch},${cs.zIndex},${cs.borderRadius},${clipCss},${rect.join(',')}`;
       if (key !== this.lastKey) {
         this.lastKey = key;
         Object.assign(canvas.style, {
           left: `${left}px`,
           top: `${top}px`,
-          width: `${r.width}px`,
-          height: `${r.height}px`,
+          width: `${cssW}px`,
+          height: `${cssH}px`,
           zIndex: cs.zIndex,
           borderRadius: cs.borderRadius,
           clipPath: clipCss
@@ -3059,6 +3195,7 @@
       const done = () => { this.inFlight = Math.max(0, this.inFlight - 1); };
       device.queue.onSubmittedWorkDone().then(done, done);
       if (this.canvas.style.display !== 'block') this.canvas.style.display = 'block';
+      if (this.canvas.style.visibility !== 'visible') this.canvas.style.visibility = 'visible';
     }
 
     destroy() {
@@ -3270,35 +3407,56 @@
 
   // Watch DOM for dynamically added/removed videos (YouTube SPA, Shorts, embeds)
   const domObserver = new MutationObserver((mutations) => {
+    let needPruneVideos = false;
+    let needImagePump = false;
+    const wantImgs = Boolean(settings.effectiveImages);
     for (const m of mutations) {
-      for (const node of m.addedNodes) {
+      const added = m.addedNodes;
+      for (let i = 0; i < added.length; i++) {
+        const node = added[i];
+        if (node.nodeType !== 1) continue;
+        if (node.hasAttribute('data-truehdr') || node.hasAttribute('data-truehdr-split')) continue;
         if (node instanceof HTMLVideoElement) {
           attachVideo(node);
-        } else if (node instanceof Element && (node.tagName === 'VIDEO' || node.querySelector('video'))) {
-          scanVideos(node);
+        } else if (node.firstElementChild !== null) {
+          const vids = node.getElementsByTagName('video');
+          for (let j = 0; j < vids.length; j++) attachVideo(vids[j]);
         }
-        if (settings.effectiveImages) {
+        if (wantImgs) {
           if (node instanceof HTMLImageElement) {
             attachImage(node);
-            scheduleImagePump();
-          } else if (node instanceof Element && node.getAttribute('data-truehdr') === null && node.querySelector('img')) {
-            scanImages(node);
+            needImagePump = true;
+          } else if (node.firstElementChild !== null) {
+            const imgs = node.getElementsByTagName('img');
+            if (imgs.length) {
+              for (let j = 0; j < imgs.length; j++) attachImage(imgs[j]);
+              needImagePump = true;
+            }
           }
         }
       }
-      if (m.removedNodes.length && images.size) scheduleImagePump();
-      for (const node of m.removedNodes) {
-        if (node instanceof HTMLVideoElement && instances.has(node)) {
-          instances.get(node).destroy();
-        } else if (node instanceof Element) {
-          for (const v of instances.keys()) {
-            if (!v.isConnected) {
-              instances.get(v).destroy();
+      const removed = m.removedNodes;
+      if (removed.length) {
+        if (images.size) needImagePump = true;
+        if (instances.size) {
+          for (let i = 0; i < removed.length; i++) {
+            const node = removed[i];
+            if (node.nodeType !== 1) continue;
+            if (node instanceof HTMLVideoElement && instances.has(node)) {
+              instances.get(node).destroy();
+            } else if (node.firstElementChild !== null) {
+              needPruneVideos = true;
             }
           }
         }
       }
     }
+    if (needPruneVideos && instances.size) {
+      for (const v of instances.keys()) {
+        if (!v.isConnected) instances.get(v).destroy();
+      }
+    }
+    if (needImagePump) scheduleImagePump();
   });
 
   function startObserving() {
@@ -3439,6 +3597,10 @@
       for (const inst of instances.values()) {
         if (srCfgChanged) inst.resetSRGuard();
         inst.dirtyRender = true;
+        inst.lastDecodedFrames = -1;
+        if (settings.effectiveEnabled) {
+          inst.maybeInitResources();
+        }
         inst.syncOverlayLayout(needsLayout);
         inst.syncSplitHandle();
         if (settings.effectiveEnabled) {

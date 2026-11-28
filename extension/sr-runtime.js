@@ -609,13 +609,27 @@
       w = w | 0; h = h | 0;
       if (w < 1 || h < 1) throw new Error('TrueHDR SR: bad size');
       if (w !== state.w || h !== state.h) allocate(w, h);
-      for (var i = 0; i < built.length; i++) {
-        var b = built[i], desc = { label: b.gen.label };
-        if (querySet) desc.timestampWrites = { querySet: querySet, beginningOfPassWriteIndex: 2 * i, endOfPassWriteIndex: 2 * i + 1 };
-        var pass = encoder.beginComputePass(desc);
-        pass.setPipeline(b.pipeline);
-        pass.setBindGroup(0, bindGroup(i, inputView));
-        pass.dispatchWorkgroups(Math.ceil(w / b.gen.tile[0]), Math.ceil(h / b.gen.tile[1]), 1);
+      if (querySet) {
+        for (var i = 0; i < built.length; i++) {
+          var b = built[i];
+          var pass = encoder.beginComputePass({
+            label: b.gen.label,
+            timestampWrites: { querySet: querySet, beginningOfPassWriteIndex: 2 * i, endOfPassWriteIndex: 2 * i + 1 }
+          });
+          pass.setPipeline(b.pipeline);
+          pass.setBindGroup(0, bindGroup(i, inputView));
+          pass.dispatchWorkgroups(Math.ceil(w / b.gen.tile[0]), Math.ceil(h / b.gen.tile[1]), 1);
+          pass.end();
+        }
+      } else {
+        // Single compute pass for all SR kernels avoids 5-6 encoder transitions per frame.
+        var pass = encoder.beginComputePass({ label: 'truehdr-sr-' + m.id });
+        for (var j = 0; j < built.length; j++) {
+          var b2 = built[j];
+          pass.setPipeline(b2.pipeline);
+          pass.setBindGroup(0, bindGroup(j, inputView));
+          pass.dispatchWorkgroups(Math.ceil(w / b2.gen.tile[0]), Math.ceil(h / b2.gen.tile[1]), 1);
+        }
         pass.end();
       }
       return { view: state.outView, width: 2 * w, height: 2 * h };
